@@ -1,0 +1,49 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Runtime state produced by this module. The SQLite occurrence store and the
+# Drain3 template snapshot are rebuildable local data, never source.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+drain3.bin
+*.drain3.bin
+
+# Drain3 reads drain3.ini from the working directory. The module passes an
+# explicit config so it is ignored, but keep stray local copies out of the repo.
+drain3.ini
+
+# Claude Code: keep shared project settings, ignore personal overrides
+.claude/settings.local.json
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
