@@ -36,6 +36,9 @@ drain3.bin
 # explicit config so it is ignored, but keep stray local copies out of the repo.
 drain3.ini
 
+# Streamlit writes local config/credentials here
+.streamlit/
+
 # Claude Code: keep shared project settings, ignore personal overrides
 .claude/settings.local.json
 

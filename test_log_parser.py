@@ -119,3 +119,42 @@ def test_padding_does_not_duplicate(tmp_path):
     assert parser.store.count_events() == count_after_second
 
     parser.close()
+
+
+def test_template_counts_and_ts_bounds(tmp_path):
+    """The two read helpers the UI needs: per-template counts and the ts span."""
+    parser = make_parser(tmp_path, fetch_fn=lambda t1, t2: [])
+    store = parser.store
+
+    # Empty store: no counts, no bounds.
+    assert store.template_counts(0, 10_000) == []
+    assert store.ts_bounds() is None
+
+    # Three "logged in" lines share a template; one disk line is its own.
+    for i, ts in enumerate((100, 200, 300)):
+        parser.ingest({
+            "message": f"User {i} logged in from 10.0.0.{i}",
+            "ts": ts,
+            "source_key": "clientA|server1",
+            "extra": {},
+        })
+    parser.ingest({
+        "message": "Disk sda full at 91%",
+        "ts": 400,
+        "source_key": "clientA|server2",
+        "extra": {},
+    })
+
+    counts = store.template_counts(0, 10_000)
+    assert [n for _, n in counts] == [3, 1], "most frequent template first"
+    login_id, disk_id = counts[0][0], counts[1][0]
+    assert login_id != disk_id
+
+    # Restricted to the window: only two logins fall in [150, 350].
+    assert store.template_counts(150, 350) == [(login_id, 2)]
+    # A window with nothing in it yields no rows at all.
+    assert store.template_counts(500, 600) == []
+
+    assert store.ts_bounds() == (100, 400)
+
+    parser.close()

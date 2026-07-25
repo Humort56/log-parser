@@ -13,8 +13,13 @@ dependencies = ["drain3==0.9.11"]
 
 [project.optional-dependencies]
 dev = ["pytest==9.1.1"]
+# The Streamlit UI (log_parser.ui) is optional: installing the library to use
+# LogParser in a pipeline must not drag in streamlit's transitive tree. Range
+# pins rather than == because these are consumed through stable public APIs,
+# unlike drain3 whose internals we rely on.
+ui = ["streamlit>=1.50,<2", "pandas>=2.0,<3"]
 
 [tool.setuptools]
-# Single-module distribution. Listed explicitly so the test modules sitting
-# beside it at the repo root are NOT swept into the installed package.
-py-modules = ["log_parser"]
+# Listed explicitly so the test modules sitting beside the package at the repo
+# root are NOT swept into the installed distribution.
+packages = ["log_parser"]

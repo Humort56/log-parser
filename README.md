@@ -19,6 +19,12 @@ Pin a tag or commit for reproducible installs:
 pip install git+https://github.com/<user>/<repo>.git@v0.1.0
 ```
 
+The web UI is an optional extra, so installing the library alone stays light:
+
+```bash
+pip install "log-parser[ui] @ git+https://github.com/<user>/<repo>.git"
+```
+
 ## Usage
 
 Construct with a `fetch_fn(t1, t2) -> list[record]`. That function is the only thing
@@ -68,6 +74,10 @@ One dict flows through everything:
 `query` returns rows with `ts`, `template_id`, `source_key`, and `extra`
 (JSON-decoded).
 
+`parser.store` also exposes `count_events()`, `template_counts(t1, t2)` (per-template
+occurrence counts for a window, most frequent first) and `ts_bounds()` (the full span
+of stored events).
+
 ## How queries stay local-first
 
 1. If `[t1, t2]` is fully covered by previously fetched ranges, read from SQLite and
@@ -84,16 +94,73 @@ Dedup is enforced **in the database**, not in application code: identity is
 `INSERT OR IGNORE`. Duplicates are physically unable to be created. `extra` is not part
 of identity — a re-delivered event with different `extra` is still the same event.
 
+## Web UI
+
+```bash
+pip install "log-parser[ui] @ git+https://github.com/<user>/<repo>.git"
+python -m log_parser
+```
+
+A Streamlit app for browsing what has been parsed. Pick a UTC window, press
+**Load window**, and filter the results by time, `source_key`, or `extra`
+content — either with the key/value picker or the free-text search, which also
+matches the mined template text.
+
+The app is a plain frontend to `LogParser.query`: loading a window reads
+locally when it is already covered and fetches only the ranges that are
+missing. There is no separate "offline" mode, because `query` already makes
+that decision.
+
+Arguments are forwarded to Streamlit, so `python -m log_parser --server.port 8600`
+works.
+
+### Where the data comes from
+
+The sidebar picks a **fetcher** — the `fetch_fn` the parser calls for missing
+ranges. A built-in `demo (synthetic)` generator ships with it, so the UI is
+usable immediately with no configuration and no network.
+
+To point it at a real source, register your own in `log_parser/fetchers.py`:
+
+```python
+from log_parser.fetchers import ConfigField, Fetcher, register
+
+def _build(config):
+    def fetch_fn(t1, t2):
+        ...                        # return records with ts in [t1, t2]
+    return fetch_fn
+
+register(Fetcher(
+    name="my source",
+    description="Reads from ...",
+    config_fields=[ConfigField("url", "Base URL", default="https://...")],
+    build=_build,
+))
+```
+
+Its `config_fields` are rendered as sidebar widgets automatically. Records that
+lack a string `message`, an int `ts`, or a string `source_key` are dropped
+before ingestion and reported in the UI, so one malformed record cannot abort
+an otherwise good fetch.
+
+Note that `log_parser.ui` is the only module that imports Streamlit — `import
+log_parser` never does, so the parser keeps working wherever the `ui` extra is
+not installed.
+
 ## Development
 
 ```bash
 python -m venv .venv
-.venv/Scripts/pip install -e ".[dev]"    # Linux/macOS: .venv/bin/pip
+.venv/Scripts/pip install -e ".[dev,ui]"    # Linux/macOS: .venv/bin/pip
 .venv/Scripts/python -m pytest -q
 ```
 
-Tests: two cover the module contract (ingestion, and that padding cannot duplicate);
-the rest cover the coverage algebra (`merge_ranges`, `missing_ranges`).
+Omit `,ui` to work on the parser alone; the UI tests skip themselves when
+Streamlit is absent.
+
+Tests: two cover the module contract (ingestion, and that padding cannot
+duplicate); the rest cover the coverage algebra (`merge_ranges`,
+`missing_ranges`), the UI's pure helpers, and the package facade.
 
 ## Notes
 

@@ -174,6 +174,27 @@ class SqliteStore:
     def count_events(self) -> int:
         return self._db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
+    def template_counts(self, t1: int, t2: int) -> List[Tuple[int, int]]:
+        """(template_id, occurrences) in [t1, t2], most frequent first.
+
+        Aggregated in SQL rather than over read rows so the counts stay exact
+        even when a caller reads only a capped slice of a large window. Served
+        by ix_events_template_ts.
+        """
+        return [
+            (template_id, count)
+            for template_id, count in self._db.execute(
+                "SELECT template_id, COUNT(*) AS n FROM events "
+                "WHERE ts BETWEEN ? AND ? GROUP BY template_id ORDER BY n DESC, template_id",
+                (t1, t2),
+            ).fetchall()
+        ]
+
+    def ts_bounds(self) -> Tuple[int, int] | None:
+        """(min_ts, max_ts) across all events, or None when the store is empty."""
+        low, high = self._db.execute("SELECT MIN(ts), MAX(ts) FROM events").fetchone()
+        return None if low is None else (low, high)
+
     def fetched_ranges(self) -> List[Range]:
         return [
             (start, end)

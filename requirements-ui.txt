@@ -1,0 +1,6 @@
+# Streamlit UI (log_parser.ui). Mirrors the "ui" extra in pyproject.toml.
+# Equivalent to: pip install -e ".[ui]"
+-r requirements.txt
+
+streamlit>=1.50,<2
+pandas>=2.0,<3
