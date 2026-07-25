@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "log-parser"
+version = "0.1.0"
+description = "Local-first log parsing: Drain3 templates + SQLite occurrences"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["drain3==0.9.11"]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+[tool.setuptools]
+# Single-module distribution. Listed explicitly so the test modules sitting
+# beside it at the repo root are NOT swept into the installed package.
+py-modules = ["log_parser"]
