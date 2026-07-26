@@ -31,6 +31,9 @@ dist/
 *.sqlite3
 drain3.bin
 *.drain3.bin
+# Sidecar fingerprint written next to the snapshot, recording the mining config
+# it was built with. Rebuilt on save, like the snapshot itself.
+*.bin.config
 
 # Drain3 reads drain3.ini from the working directory. The module passes an
 # explicit config so it is ignored, but keep stray local copies out of the repo.

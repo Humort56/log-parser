@@ -9,9 +9,12 @@ dependency; importing it here would make the *parser* unimportable for anyone
 who installed the library alone or whose streamlit install is broken. Only
 ``log_parser.ui`` imports it, and only when that module is actually used.
 
-:mod:`log_parser.fetchers` is safe to re-export here -- it imports nothing but
-the standard library and :mod:`log_parser.core` -- so a user's ``app.py`` can
-declare its fetcher with a single ``from log_parser import ...``.
+:mod:`log_parser.fetchers` and :mod:`log_parser.views` are safe to re-export
+here -- both import nothing but the standard library and :mod:`log_parser.core`
+-- so a user's ``app.py`` can declare its fetcher *and* its custom rendering
+with a single ``from log_parser import ...``. ``views`` describes what the page
+draws but never imports streamlit itself, which is what keeps it on this side of
+the line.
 
 ``run_app`` is the one exception: it lives in :mod:`log_parser.ui` and needs
 streamlit, so it is resolved lazily by ``__getattr__`` below. That keeps
@@ -23,6 +26,10 @@ import logging
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
+# Re-exported so tuning drain3 does not force a second, version-coupled import
+# into a user's app.py -- `from log_parser import TemplateMinerConfig`.
+from drain3.template_miner_config import TemplateMinerConfig
+
 from log_parser.core import (
     DEFAULT_MARGIN_SEC,
     FetchFn,
@@ -31,10 +38,12 @@ from log_parser.core import (
     Record,
     SqliteStore,
     TemplateModel,
+    config_fingerprint,
     merge_ranges,
     missing_ranges,
 )
 from log_parser.fetchers import ConfigField, Fetcher
+from log_parser.views import Layout, QueryResult, View, ViewContext
 
 if TYPE_CHECKING:  # For type checkers only -- never executed at runtime.
     from log_parser.ui import run_app
@@ -54,12 +63,18 @@ __all__ = [
     "ConfigField",
     "FetchFn",
     "Fetcher",
+    "Layout",
     "LogParser",
+    "QueryResult",
     "Range",
     "Record",
     "SqliteStore",
+    "TemplateMinerConfig",
     "TemplateModel",
+    "View",
+    "ViewContext",
     "__version__",
+    "config_fingerprint",
     "merge_ranges",
     "missing_ranges",
     "run_app",

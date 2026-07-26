@@ -23,11 +23,13 @@ affects matching. SQLite remains the sole source of truth for occurrences.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from drain3 import TemplateMiner
@@ -96,6 +98,39 @@ def missing_ranges(t1: int, t2: int, covered: Iterable[Range]) -> list[Range]:
 # --------------------------------------------------------------------------
 
 
+#: Config attributes that decide which messages collapse into which template.
+#: Only these are fingerprinted: the rest (profiling, snapshot cadence) change
+#: how drain3 runs, not what it produces, and must not trigger a warning.
+_MINING_CONFIG_KEYS = (
+    "drain_depth",
+    "drain_extra_delimiters",
+    "drain_max_children",
+    "drain_max_clusters",
+    "drain_sim_th",
+    "mask_prefix",
+    "mask_suffix",
+    "parametrize_numeric_tokens",
+)
+
+
+def config_fingerprint(config: TemplateMinerConfig) -> str:
+    """A stable digest of the settings that affect template identity.
+
+    Masking instructions are folded in by their patterns: they rewrite messages
+    before mining, so changing them changes the resulting templates just as
+    surely as ``sim_th`` does.
+    """
+    values: dict[str, Any] = {key: getattr(config, key, None) for key in _MINING_CONFIG_KEYS}
+    values["masking_instructions"] = sorted(
+        # Instruction objects are drain3-internal and not reliably comparable;
+        # their regex pattern is the part that changes behaviour.
+        str(getattr(rule, "pattern", rule))
+        for rule in config.masking_instructions or ()
+    )
+    blob = json.dumps(values, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
 class TemplateModel:
     """Drain3 template tree with its own file persistence."""
 
@@ -103,10 +138,51 @@ class TemplateModel:
         # Pass an explicit config: TemplateMiner(config=None) silently loads
         # drain3.ini from the current working directory, which would make
         # parsing behaviour depend on where the process was launched.
+        config = config or TemplateMinerConfig()
+        self._fingerprint_path = Path(f"{state_path}.config")
+        self._fingerprint = config_fingerprint(config)
+        self._warn_on_config_change()
         self._miner = TemplateMiner(
             FilePersistence(state_path),
-            config=config or TemplateMinerConfig(),
+            config=config,
         )
+
+    def _warn_on_config_change(self) -> None:
+        """Warn when this config would mine differently than the snapshot did.
+
+        Mining settings decide which messages share a ``template_id``, and ids
+        are what SQLite stores. Reopening an existing snapshot under changed
+        settings therefore leaves the store holding ids from the old vocabulary
+        while new rows get ids from the new one -- and because ``fetched_ranges``
+        still marks those windows covered, a re-query will not re-derive them.
+        Nothing raises, because the caller may have changed the config on
+        purpose; but the mismatch must not be silent.
+
+        The fingerprint is a sidecar rather than something embedded in the
+        snapshot: that file is an opaque pickle drain3 owns, and writing our own
+        fields into it would couple us to its format.
+        """
+        try:
+            previous = self._fingerprint_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return  # First run with this snapshot, or one written before configs were tracked.
+        except OSError:
+            logger.warning(
+                "Could not read %s; skipping the config check",
+                self._fingerprint_path,
+                exc_info=True,
+            )
+            return
+
+        if previous != self._fingerprint:
+            logger.warning(
+                "Drain3 config changed since %s was written (%s -> %s). Template ids already "
+                "in the database were mined under the old settings and will not match ids "
+                "mined now. Use a fresh state_path and db_path, or reparse from scratch.",
+                self._fingerprint_path.name,
+                previous,
+                self._fingerprint,
+            )
 
     def template_id(self, message: str) -> int:
         """Match or learn ``message``; return its cluster id."""
@@ -129,6 +205,14 @@ class TemplateModel:
     def save(self) -> None:
         """Flush the template tree so learning since the last snapshot survives."""
         self._miner.save_state("close")
+        # Written after the snapshot, so a failed save never leaves a fingerprint
+        # claiming to describe a tree that was not persisted.
+        try:
+            self._fingerprint_path.write_text(self._fingerprint, encoding="utf-8")
+        except OSError:
+            # The templates are saved either way; losing the sidecar only costs
+            # the config-change warning, which must not be worth failing a save.
+            logger.warning("Could not write %s", self._fingerprint_path, exc_info=True)
 
 
 # --------------------------------------------------------------------------
@@ -298,10 +382,15 @@ class LogParser:
         db_path: str,
         state_path: str,
         margin_sec: int = DEFAULT_MARGIN_SEC,
+        config: TemplateMinerConfig | None = None,
     ):
         self._fetch_fn = fetch_fn
         self._margin_sec = margin_sec
-        self.model = TemplateModel(state_path)
+        # config tunes how drain3 mines templates (sim_th, depth, masking...).
+        # None means drain3's own defaults -- never drain3.ini from the cwd; see
+        # TemplateModel. Changing it against an existing store is a reparse, not
+        # a setting: TemplateModel logs a warning if the snapshot disagrees.
+        self.model = TemplateModel(state_path, config)
         self.store = SqliteStore(db_path)
 
     def ingest(self, record: Record) -> bool:

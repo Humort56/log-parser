@@ -10,7 +10,7 @@ stays an ordinary dependency you can upgrade without losing this code.
 
 from typing import Any
 
-from log_parser import ConfigField, Fetcher, FetchFn, Record, run_app
+from log_parser import ConfigField, Fetcher, FetchFn, Record, View, ViewContext, run_app
 
 
 def build_fetcher(config: dict[str, Any]) -> FetchFn:
@@ -49,6 +49,26 @@ def build_fetcher(config: dict[str, Any]) -> FetchFn:
     return fetch_fn
 
 
+def render_levels(ctx: ViewContext) -> None:
+    """An extra tab, drawn after the built-in Events and Templates.
+
+    ``ctx.filtered`` is the loaded window after the sidebar filters; the
+    unfiltered rows stay available as ``ctx.result.rows``. The data is already
+    in memory, so a view costs nothing to draw and never triggers a fetch.
+    """
+    import streamlit as st
+
+    counts: dict[str, int] = {}
+    for row in ctx.filtered:
+        level = str(row.get("extra", {}).get("level", "unknown"))
+        counts[level] = counts.get(level, 0) + 1
+
+    if not counts:
+        st.info("No events match the current filters.")
+        return
+    st.bar_chart(counts)
+
+
 run_app(
     Fetcher(
         name="my source",
@@ -63,4 +83,12 @@ run_app(
     # One app reads one source into one store. For a second source, copy this
     # file and give it its own db_path so the coverage ranges stay separate.
     db_path="events.db",
+    # Extra tabs. Add `replace_default_views=True` to drop Events and Templates
+    # and show only these.
+    views=[View("Levels", render_levels)],
+    # Individual regions can be replaced too, without touching the rest of the
+    # page -- anything left unset keeps its built-in:
+    #
+    #     from log_parser import Layout
+    #     layout=Layout(metrics=my_metrics, events=my_events_table),
 )

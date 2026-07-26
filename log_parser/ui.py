@@ -19,6 +19,12 @@ SQLite or calling ``fetch_fn`` for the ranges it is missing. There is no
 read-only mode and no fetch toggle, because ``query`` already makes that
 distinction correctly.
 
+What the page *draws* is extensible from that same script: ``views=`` adds tabs
+and ``layout=`` replaces individual regions, both defined in
+:mod:`log_parser.views`. The private ``_render_*`` functions below are the
+default implementations of those regions, not internals -- a caller replaces one
+by passing its own, and the rest keep rendering as they do here.
+
 This module imports streamlit at the top level; ``log_parser/__init__.py``
 deliberately does not import this module, so the parser stays usable when
 streamlit is absent.
@@ -31,13 +37,13 @@ import json
 import logging
 import sqlite3
 import traceback
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
+from drain3.template_miner_config import TemplateMinerConfig
 
 from log_parser.core import (
     DEFAULT_MARGIN_SEC,
@@ -48,6 +54,7 @@ from log_parser.core import (
     TemplateModel,
 )
 from log_parser.fetchers import Fetcher, validated
+from log_parser.views import Layout, QueryResult, View, ViewContext, resolve_views
 
 logger = logging.getLogger(__name__)
 
@@ -227,7 +234,9 @@ def template_table(
 # --------------------------------------------------------------------------
 
 
-def load_templates(state_path: str) -> dict[int, tuple[str, int]]:
+def load_templates(
+    state_path: str, config: TemplateMinerConfig | None = None
+) -> dict[int, tuple[str, int]]:
     """``{cluster_id: (template_text, all_time_size)}`` from the Drain3 snapshot.
 
     Constructing a TemplateModel neither creates nor rewrites the snapshot; only
@@ -236,7 +245,7 @@ def load_templates(state_path: str) -> dict[int, tuple[str, int]]:
     foreign or truncated snapshot should cost the template *text*, not the page.
     """
     try:
-        return TemplateModel(state_path).clusters()
+        return TemplateModel(state_path, config).clusters()
     except Exception:
         # Swallowed deliberately (see above), but never silently: without a log
         # line a corrupt snapshot is indistinguishable from an empty one, and
@@ -245,25 +254,14 @@ def load_templates(state_path: str) -> dict[int, tuple[str, int]]:
         return {}
 
 
-@dataclass(frozen=True)
-class QueryResult:
-    """Everything one loaded window gives the page.
-
-    A dataclass rather than a dict so a mistyped field is an error at the call
-    site instead of a ``KeyError`` halfway down the render.
-    """
-
-    rows: list[Record]
-    counts: list[tuple[int, int]]
-    bounds: tuple[int, int] | None
-    total: int
-    gaps: list[tuple[int, int]]
-    skipped: int
-    templates: dict[int, tuple[str, int]]
-
-
 def run_query(
-    fetch_fn: FetchFn, db_path: str, state_path: str, margin_sec: int, t1: int, t2: int
+    fetch_fn: FetchFn,
+    db_path: str,
+    state_path: str,
+    margin_sec: int,
+    t1: int,
+    t2: int,
+    config: TemplateMinerConfig | None = None,
 ) -> QueryResult:
     """Query ``[t1, t2]`` through V1, then read back what the UI needs.
 
@@ -281,6 +279,7 @@ def run_query(
         db_path=db_path,
         state_path=state_path,
         margin_sec=margin_sec,
+        config=config,
     ) as parser:
         gaps = parser.store.missing(t1, t2)
         rows = parser.query(t1, t2)
@@ -295,7 +294,7 @@ def run_query(
         total=total,
         gaps=gaps,
         skipped=len(skipped),
-        templates=load_templates(state_path),
+        templates=load_templates(state_path, config),
     )
 
 
@@ -439,12 +438,13 @@ def _load_window(
     t1: int,
     t2: int,
     cache_key: tuple[Any, ...],
+    config: TemplateMinerConfig | None = None,
 ) -> None:
     """Run the query, storing the result or the error in session state."""
     with st.spinner(f"Querying {format_ts(t1)} → {format_ts(t2)} (UTC)…"):
         try:
             st.session_state["result"] = run_query(
-                fetch_fn, db_path, state_path, margin_sec, t1, t2
+                fetch_fn, db_path, state_path, margin_sec, t1, t2, config
             )
             st.session_state["cache_key"] = cache_key
             st.session_state.pop("error", None)
@@ -466,10 +466,10 @@ def _load_window(
             )
 
 
-def _render_error() -> None:
-    if "error" not in st.session_state:
-        return
-    message, detail = st.session_state["error"]
+def _render_error(message: str, detail: str) -> None:
+    """Draw a failed query. Takes the message directly: there is no
+    ``QueryResult`` to build a :class:`ViewContext` from when the query is what
+    failed."""
     st.error(message)
     if detail:
         with st.expander("Details"):
@@ -500,7 +500,8 @@ def _apply_filters(
     ]
 
 
-def _render_warnings(result: QueryResult, state_path: str) -> None:
+def _render_warnings(ctx: ViewContext) -> None:
+    result = ctx.result
     if result.skipped:
         st.warning(
             f"{result.skipped:,} malformed record(s) from the fetcher were "
@@ -512,14 +513,15 @@ def _render_warnings(result: QueryResult, state_path: str) -> None:
     if unknown:
         st.warning(
             f"{len(unknown)} template id(s) in this window are absent from "
-            f"`{state_path}` — is it the snapshot that goes with this database?"
+            f"`{ctx.state_path}` — is it the snapshot that goes with this database?"
         )
 
 
-def _render_metrics(result: QueryResult, filtered: Sequence[Record]) -> None:
+def _render_metrics(ctx: ViewContext) -> None:
+    result = ctx.result
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("In window", f"{len(result.rows):,}")
-    col2.metric("After filters", f"{len(filtered):,}")
+    col2.metric("After filters", f"{len(ctx.filtered):,}")
     col3.metric("Templates", f"{len(result.counts):,}")
     col4.metric("Gaps fetched", f"{len(result.gaps):,}")
     if result.gaps:
@@ -528,7 +530,8 @@ def _render_metrics(result: QueryResult, filtered: Sequence[Record]) -> None:
         )
 
 
-def _render_events_tab(result: QueryResult, filtered: Sequence[Record], t1: int, t2: int) -> None:
+def _render_events_tab(ctx: ViewContext) -> None:
+    result, filtered = ctx.result, ctx.filtered
     if not result.rows:
         if result.total and result.bounds:
             st.info(
@@ -561,12 +564,13 @@ def _render_events_tab(result: QueryResult, filtered: Sequence[Record], t1: int,
     st.download_button(
         "Download filtered as CSV",
         rows_to_dataframe(filtered, result.templates).to_csv(index=False).encode(),
-        file_name=f"events_{t1}_{t2}.csv",
+        file_name=f"events_{ctx.t1}_{ctx.t2}.csv",
         mime="text/csv",
     )
 
 
-def _render_templates_tab(result: QueryResult, filtered: Sequence[Record]) -> None:
+def _render_templates_tab(ctx: ViewContext) -> None:
+    result, filtered = ctx.result, ctx.filtered
     if not result.counts:
         st.info("No templates in this window.")
         return
@@ -588,6 +592,61 @@ def _render_templates_tab(result: QueryResult, filtered: Sequence[Record]) -> No
     )
 
 
+def default_views(layout: Layout) -> list[View]:
+    """The tabs the app ships with, honouring any overrides in ``layout``.
+
+    A function rather than a module-level constant so that nothing is built at
+    import time, and so a caller cannot mutate a shared instance.
+    """
+    return [
+        View("Events", layout.events or _render_events_tab),
+        View("Templates", layout.templates or _render_templates_tab),
+    ]
+
+
+def _check_arguments(fetcher: Fetcher, views: Sequence[View], layout: Layout | None) -> None:
+    """Reject bad arguments before the first streamlit call.
+
+    Kept ahead of ``set_page_config`` deliberately: a mistake here belongs at
+    the call site in the user's ``app.py``, where the fix is, rather than inside
+    a page-wide traceback that streamlit renders after half the app has drawn.
+    """
+    if not isinstance(fetcher, Fetcher):
+        raise TypeError(
+            f"run_app() takes a single Fetcher, got {type(fetcher).__name__}. "
+            "See log_parser.fetchers for its shape."
+        )
+
+    for index, view in enumerate(views):
+        if not isinstance(view, View):
+            raise TypeError(
+                f"run_app(views=...) takes View instances, got "
+                f"{type(view).__name__} at index {index}. "
+                "See log_parser.views for its shape."
+            )
+        if not callable(view.render):
+            raise TypeError(
+                f"View({view.name!r}).render must be callable, got {type(view.render).__name__}."
+            )
+
+    # Streamlit keys tabs off their label, so two identical names render as two
+    # tabs of which only one is ever reachable.
+    names = [view.name for view in views]
+    duplicates = sorted({name for name in names if names.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"run_app(views=...) has duplicate view name(s): {', '.join(duplicates)}.")
+
+    if layout is not None:
+        if not isinstance(layout, Layout):
+            raise TypeError(
+                f"run_app(layout=...) takes a Layout, got {type(layout).__name__}. "
+                "See log_parser.views for its shape."
+            )
+        for name, callback in layout.callbacks().items():
+            if not callable(callback):
+                raise TypeError(f"Layout.{name} must be callable, got {type(callback).__name__}.")
+
+
 def run_app(
     fetcher: Fetcher,
     *,
@@ -595,6 +654,11 @@ def run_app(
     icon: str = "🪵",
     db_path: str = "events.db",
     state_path: str = "drain3.bin",
+    config: TemplateMinerConfig | None = None,
+    views: Sequence[View] = (),
+    replace_default_views: bool = False,
+    layout: Layout | None = None,
+    sidebar_extra: Callable[[], None] | None = None,
 ) -> None:
     """Render the whole app. Call this from your own Streamlit script.
 
@@ -611,14 +675,42 @@ def run_app(
 
     The path arguments only seed the sidebar inputs; the user can still change
     them at runtime.
+
+    ``config`` is a :class:`~drain3.template_miner_config.TemplateMinerConfig`
+    tuning how messages are mined into templates (``drain_sim_th``,
+    ``drain_depth``, masking rules...). It is a constructor argument rather than
+    a sidebar widget on purpose: it decides which messages share a
+    ``template_id``, and those ids are already written into the database, so
+    changing it belongs with a fresh ``db_path`` and ``state_path`` rather than
+    with a re-render.
+
+    Rendering is extensible from your own script, without editing this module:
+
+    ``views``
+        Extra :class:`~log_parser.views.View` tabs, drawn after Events and
+        Templates. Each ``render`` is called with a
+        :class:`~log_parser.views.ViewContext` for the loaded window.
+    ``replace_default_views``
+        Drop the built-in tabs and show only ``views``. Requires ``views``.
+    ``layout``
+        A :class:`~log_parser.views.Layout` replacing individual regions --
+        metrics, warnings, the two tab bodies, the error block, the sidebar
+        filters. Anything left ``None`` keeps its built-in.
+    ``sidebar_extra``
+        Called at the end of the sidebar, after the filters. Takes no
+        arguments: it runs before a window is loaded, so there is no context to
+        hand it. Read its widgets back through ``st.session_state`` in whichever
+        view needs them.
     """
-    # Before any streamlit call: a bad argument must raise TypeError rather
-    # than fail somewhere inside the page render.
-    if not isinstance(fetcher, Fetcher):
-        raise TypeError(
-            f"run_app() takes a single Fetcher, got {type(fetcher).__name__}. "
-            "See log_parser.fetchers for its shape."
+    _check_arguments(fetcher, views, layout)
+    if replace_default_views and not views:
+        raise ValueError(
+            "run_app(replace_default_views=True) needs at least one view in "
+            "views=, otherwise the page renders no tabs at all."
         )
+    layout = layout or Layout()
+    tabs = resolve_views(default_views(layout), views, replace_defaults=replace_default_views)
+
     st.set_page_config(page_title=title, page_icon=icon, layout="wide")
     st.title(f"{icon} {title}")
 
@@ -643,29 +735,45 @@ def run_app(
         st.sidebar.caption("⚠️ Settings changed — press Load window to refresh.")
 
     if load:
-        _load_window(fetch_fn, db_path, state_path, margin_sec, t1, t2, cache_key)
+        _load_window(fetch_fn, db_path, state_path, margin_sec, t1, t2, cache_key, config)
 
-    _render_error()
+    if "error" in st.session_state:
+        message, detail = st.session_state["error"]
+        (layout.error or _render_error)(message, detail)
 
     result: QueryResult | None = st.session_state.get("result")
     if result is None:
+        if sidebar_extra is not None:
+            sidebar_extra()
         st.info(
             "Pick a time window in the sidebar and press **Load window**. "
             "Windows already stored are served locally; anything missing is fetched."
         )
         return
 
-    filters = _sidebar_filters(result.rows)
+    filters = (layout.filters or _sidebar_filters)(result.rows)
     filtered = _apply_filters(result.rows, result.templates, filters)
+    if sidebar_extra is not None:
+        sidebar_extra()
 
-    _render_warnings(result, state_path)
-    _render_metrics(result, filtered)
+    ctx = ViewContext(
+        result=result,
+        filtered=filtered,
+        t1=t1,
+        t2=t2,
+        db_path=db_path,
+        state_path=state_path,
+    )
 
-    events_tab, templates_tab = st.tabs(["Events", "Templates"])
-    with events_tab:
-        _render_events_tab(result, filtered, t1, t2)
-    with templates_tab:
-        _render_templates_tab(result, filtered)
+    (layout.warnings or _render_warnings)(ctx)
+    (layout.metrics or _render_metrics)(ctx)
+
+    # st.tabs returns one container per label, in order, so indexing by
+    # position pairs each view with its own tab.
+    containers = st.tabs([view.name for view in tabs])
+    for view, container in zip(tabs, containers, strict=True):
+        with container:
+            view.render(ctx)
 
 
 if __name__ == "__main__":
