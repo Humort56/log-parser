@@ -1,24 +1,32 @@
-"""Pluggable ``fetch_fn`` sources for the UI.
+"""Describing a ``fetch_fn`` source to the UI.
 
 A fetch function answers exactly one question -- "give me records between A and
 B" -- and knows nothing about coverage, padding or dedup. :class:`Fetcher` wraps
-one with enough metadata for the UI to render its configuration, so adding a new
-source needs no changes to ``log_parser.ui``.
+one with enough metadata for the UI to render its configuration, so a new source
+needs no changes to ``log_parser.ui``.
 
-To add your own::
+Sources are passed *in*, from your own script::
 
-    def _build_my_source(config):
+    # app.py
+    from log_parser import ConfigField, Fetcher, run_app
+
+    def build(config):
         url = config["url"]
         def fetch_fn(t1, t2):
             ...                       # return a list of records
         return fetch_fn
 
-    register(Fetcher(
+    run_app(Fetcher(
         name="my source",
         description="Reads from ...",
         config_fields=[ConfigField("url", "Base URL", default="https://...")],
-        build=_build_my_source,
+        build=build,
     ))
+
+There is no registry and no import-time registration: the app reads exactly the
+source handed to it, so what it talks to is decided by the argument at the call
+site rather than by which modules happen to have been imported. One app serves
+one source -- see :func:`log_parser.ui.run_app` for why.
 
 This module deliberately does not import streamlit: the UI reads
 ``config_fields`` and renders the widgets itself.
@@ -35,9 +43,8 @@ from log_parser.core import FetchFn, Record
 __all__ = [
     "ConfigField",
     "Fetcher",
-    "FETCHERS",
-    "register",
     "validated",
+    "demo_fetcher",
     "DEMO_FETCHER_NAME",
 ]
 
@@ -55,7 +62,12 @@ class ConfigField:
 
 @dataclass(frozen=True)
 class Fetcher:
-    """A named ``fetch_fn`` factory plus the configuration it needs."""
+    """A named ``fetch_fn`` factory plus the configuration it needs.
+
+    ``build(config)`` receives the current values of ``config_fields`` and
+    returns the ``fetch_fn`` itself. Splitting it in two means an expensive
+    client is constructed once per settings change rather than once per fetch.
+    """
 
     name: str
     description: str
@@ -64,15 +76,6 @@ class Fetcher:
 
     def defaults(self) -> Dict[str, Any]:
         return {f.key: f.default for f in self.config_fields}
-
-
-FETCHERS: Dict[str, Fetcher] = {}
-
-
-def register(fetcher: Fetcher) -> Fetcher:
-    """Add ``fetcher`` to the registry the UI offers."""
-    FETCHERS[fetcher.name] = fetcher
-    return fetcher
 
 
 # --------------------------------------------------------------------------
@@ -181,17 +184,23 @@ def _build_demo(config: Dict[str, Any]) -> FetchFn:
     return fetch_fn
 
 
-register(Fetcher(
-    name=DEMO_FETCHER_NAME,
-    description=(
-        "Deterministic synthetic logs, generated locally. No network. "
-        "Lets the UI be explored without configuring a real source."
-    ),
-    build=_build_demo,
-    config_fields=[
-        ConfigField("per_minute", "Events per minute", 6, "int",
-                    help="Higher values produce denser windows."),
-        ConfigField("sources", "Distinct source hosts", 3, "int",
-                    help="How many source_key values to spread events across."),
-    ],
-))
+def demo_fetcher() -> Fetcher:
+    """The synthetic source used by ``python -m log_parser``.
+
+    A function rather than a module-level constant so that nothing is built at
+    import time, and so a caller cannot mutate a shared instance.
+    """
+    return Fetcher(
+        name=DEMO_FETCHER_NAME,
+        description=(
+            "Deterministic synthetic logs, generated locally. No network. "
+            "Lets the UI be explored without configuring a real source."
+        ),
+        build=_build_demo,
+        config_fields=[
+            ConfigField("per_minute", "Events per minute", 6, "int",
+                        help="Higher values produce denser windows."),
+            ConfigField("sources", "Distinct source hosts", 3, "int",
+                        help="How many source_key values to spread events across."),
+        ],
+    )

@@ -8,7 +8,18 @@ optional extra (``pip install log-parser[ui]``), and streamlit is a heavy
 dependency; importing it here would make the *parser* unimportable for anyone
 who installed the library alone or whose streamlit install is broken. Only
 ``log_parser.ui`` imports it, and only when that module is actually used.
+
+:mod:`log_parser.fetchers` is safe to re-export here -- it imports nothing but
+the standard library and :mod:`log_parser.core` -- so a user's ``app.py`` can
+declare its fetcher with a single ``from log_parser import ...``.
+
+``run_app`` is the one exception: it lives in :mod:`log_parser.ui` and needs
+streamlit, so it is resolved lazily by ``__getattr__`` below. That keeps
+``from log_parser import Fetcher, run_app`` working in an app script while
+``import log_parser`` still costs nothing for a pipeline that never renders.
 """
+
+from typing import TYPE_CHECKING, Any
 
 from log_parser.core import (
     DEFAULT_MARGIN_SEC,
@@ -21,10 +32,16 @@ from log_parser.core import (
     merge_ranges,
     missing_ranges,
 )
+from log_parser.fetchers import ConfigField, Fetcher
+
+if TYPE_CHECKING:  # For type checkers only -- never executed at runtime.
+    from log_parser.ui import run_app
 
 __all__ = [
     "DEFAULT_MARGIN_SEC",
+    "ConfigField",
     "FetchFn",
+    "Fetcher",
     "LogParser",
     "Range",
     "Record",
@@ -32,4 +49,18 @@ __all__ = [
     "TemplateModel",
     "merge_ranges",
     "missing_ranges",
+    "run_app",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve ``run_app`` on first access (PEP 562), importing streamlit then.
+
+    Raising ``AttributeError`` for everything else is required: without it,
+    ``hasattr``/``from … import`` probes for absent names would import the UI.
+    """
+    if name == "run_app":
+        from log_parser.ui import run_app
+
+        return run_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,9 +1,14 @@
-"""``python -m log_parser`` -- launch the Streamlit UI.
+"""``python -m log_parser`` -- launch the Streamlit UI with the demo source.
+
+This is the zero-configuration tour, not the way to run a real deployment: it
+can only offer the built-in synthetic fetcher, because a source registered in
+*this* process would not survive into the one Streamlit spawns for the script.
+To use your own fetcher, register it in your own ``app.py`` and run
+``streamlit run app.py`` -- see :mod:`log_parser.ui`.
 
 Streamlit runs a *script*, not a module: ``streamlit run -m pkg`` is not
 supported. So resolve the installed path of :mod:`log_parser.ui` and hand that
-file to Streamlit's CLI. Doing it this way means the UI ships and launches from
-an installed package, with no repo checkout and nothing for the user to locate.
+file to Streamlit's CLI; its ``__main__`` block registers the demo source.
 """
 
 from __future__ import annotations

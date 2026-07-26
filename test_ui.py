@@ -284,3 +284,52 @@ def test_validated_coerces_missing_extra_to_dict():
 
 def test_validated_tolerates_none_from_fetcher():
     assert validated(lambda t1, t2: None, [])(0, 10) == []
+
+
+# --------------------------------------------------------------------------
+# run_app argument handling
+# --------------------------------------------------------------------------
+
+def test_run_app_requires_a_fetcher():
+    """Without a source every window returns empty, which reads as a bug.
+
+    Better to fail at the call site, where the fix is, than to render an app
+    that silently cannot fetch anything.
+    """
+    from log_parser.ui import run_app
+
+    with pytest.raises(TypeError):
+        run_app()
+
+
+def test_run_app_rejects_a_bare_fetch_fn():
+    """The likely mistake is passing the function instead of the Fetcher.
+
+    Streamlit swallows the resulting AttributeError into a page-wide traceback,
+    so name the expected type before any widget is drawn.
+    """
+    from log_parser.ui import run_app
+
+    with pytest.raises(TypeError, match="single Fetcher"):
+        run_app(lambda t1, t2: [])
+
+
+def test_demo_fetcher_is_a_fresh_instance_each_call():
+    """A function, not a shared constant: callers cannot mutate each other."""
+    from log_parser.fetchers import demo_fetcher
+
+    first, second = demo_fetcher(), demo_fetcher()
+    assert first is not second
+    assert first == second           # frozen dataclass: equal by value
+    assert first.config_fields is not second.config_fields
+
+
+def test_demo_fetcher_builds_a_working_fetch_fn():
+    from log_parser.fetchers import demo_fetcher
+
+    fetch = demo_fetcher().build(demo_fetcher().defaults())
+    records = fetch(1_700_000_000, 1_700_000_600)
+    assert records, "demo fetcher produced no records"
+    assert all(r["ts"] >= 1_700_000_000 and r["ts"] <= 1_700_000_600 for r in records)
+    # More than one message shape, or the templates tab has nothing to show.
+    assert len({r["message"].split()[0] for r in records}) > 1

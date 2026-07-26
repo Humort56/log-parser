@@ -1,7 +1,16 @@
 """Streamlit UI for the log parser.
 
-Run it with ``python -m log_parser`` (see :mod:`log_parser.__main__`), or
-``streamlit run <path to this file>``.
+The app is meant to be launched from *your own* script, so your fetcher lives in
+your code rather than in an installed file that an upgrade overwrites::
+
+    # app.py
+    from log_parser import Fetcher, run_app
+
+    run_app(Fetcher(name="prod", description="...", build=build_prod),
+            title="prod logs")
+
+then ``streamlit run app.py``. ``python -m log_parser`` runs the same app with a
+synthetic demo source, for a look around before wiring anything real.
 
 The app is a plain frontend to :meth:`LogParser.query`: every window the user
 loads goes through it, and V1 decides on its own whether that means reading
@@ -31,9 +40,8 @@ from log_parser.core import (
     Record,
     SqliteStore,
     TemplateModel,
-    missing_ranges,
 )
-from log_parser.fetchers import FETCHERS, DEMO_FETCHER_NAME, validated
+from log_parser.fetchers import Fetcher, validated
 
 UTC = dt.timezone.utc
 ANY_KEY = "— any —"
@@ -270,17 +278,13 @@ def peek_store(db_path: str) -> Optional[Dict[str, Any]]:
 # UI
 # --------------------------------------------------------------------------
 
-def _sidebar_fetcher() -> Tuple[Any, str]:
+def _sidebar_fetcher(fetcher: Fetcher) -> Tuple[Any, str]:
     st.sidebar.subheader("Source")
-    names = list(FETCHERS)
-    default = names.index(DEMO_FETCHER_NAME) if DEMO_FETCHER_NAME in names else 0
-    name = st.sidebar.selectbox("Fetcher", names, index=default)
-    fetcher = FETCHERS[name]
-    st.sidebar.caption(fetcher.description)
+    st.sidebar.caption(f"**{fetcher.name}** — {fetcher.description}")
 
     config: Dict[str, Any] = {}
     for field in fetcher.config_fields:
-        widget_key = f"cfg_{name}_{field.key}"
+        widget_key = f"cfg_{fetcher.name}_{field.key}"
         if field.kind == "int":
             config[field.key] = st.sidebar.number_input(
                 field.label, value=int(field.default), step=1,
@@ -296,7 +300,7 @@ def _sidebar_fetcher() -> Tuple[Any, str]:
                 field.label, value=str(field.default),
                 help=field.help or None, key=widget_key,
             )
-    return fetcher.build(config), name
+    return fetcher.build(config), fetcher.name
 
 
 def _sidebar_window(status: Optional[Dict[str, Any]]) -> Tuple[int, int]:
@@ -352,13 +356,41 @@ def _sidebar_filters(rows: Sequence[Record]) -> Dict[str, Any]:
     }
 
 
-def main() -> None:
-    st.set_page_config(page_title="log-parser", page_icon="🪵", layout="wide")
-    st.title("🪵 log-parser")
+def run_app(
+    fetcher: Fetcher,
+    *,
+    title: str = "log-parser",
+    icon: str = "🪵",
+    db_path: str = "events.db",
+    state_path: str = "drain3.bin",
+) -> None:
+    """Render the whole app. Call this from your own Streamlit script.
+
+    Pass the source it should read::
+
+        from log_parser import Fetcher, run_app
+        run_app(Fetcher(name="prod", description="...", build=build_prod),
+                title="prod logs")
+
+    One app, one source: the store is a single ``events.db`` whose coverage
+    ranges record *that* a window was fetched, not which source answered. Two
+    sources sharing a store would let one's ranges mask the other's gaps. Point
+    a second script at a second ``db_path`` instead.
+
+    The path arguments only seed the sidebar inputs; the user can still change
+    them at runtime.
+    """
+    if not isinstance(fetcher, Fetcher):
+        raise TypeError(
+            f"run_app() takes a single Fetcher, got {type(fetcher).__name__}. "
+            "See log_parser.fetchers for its shape."
+        )
+    st.set_page_config(page_title=title, page_icon=icon, layout="wide")
+    st.title(f"{icon} {title}")
 
     st.sidebar.subheader("Store")
-    db_path = st.sidebar.text_input("Database", "events.db")
-    state_path = st.sidebar.text_input("Drain3 snapshot", "drain3.bin")
+    db_path = st.sidebar.text_input("Database", db_path)
+    state_path = st.sidebar.text_input("Drain3 snapshot", state_path)
     margin_sec = st.sidebar.number_input(
         "Fetch margin (s)", value=DEFAULT_MARGIN_SEC, min_value=0, step=10,
         help="Gaps are fetched padded by this much; the un-padded gap is recorded.",
@@ -373,7 +405,7 @@ def main() -> None:
             span = f" · {format_ts(status['bounds'][0])} → {format_ts(status['bounds'][1])}"
         st.sidebar.caption(f"`{db_path}` — {status['total']:,} events{span}")
 
-    fetch_fn, fetcher_name = _sidebar_fetcher()
+    fetch_fn, fetcher_name = _sidebar_fetcher(fetcher)
     t1, t2 = _sidebar_window(status)
 
     if t2 < t1:
@@ -527,4 +559,9 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Reached by `streamlit run .../log_parser/ui.py`, i.e. `python -m
+    # log_parser`. No caller can pass a source down this path, so offer the
+    # demo; a real source belongs in the user's own app.py.
+    from log_parser.fetchers import demo_fetcher
+
+    run_app(demo_fetcher())

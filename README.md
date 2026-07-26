@@ -96,56 +96,83 @@ of identity — a re-delivered event with different `extra` is still the same ev
 
 ## Web UI
 
-```bash
-pip install "log-parser[ui] @ git+https://github.com/<user>/<repo>.git"
-python -m log_parser
-```
-
 A Streamlit app for browsing what has been parsed. Pick a UTC window, press
 **Load window**, and filter the results by time, `source_key`, or `extra`
 content — either with the key/value picker or the free-text search, which also
 matches the mined template text.
 
-The app is a plain frontend to `LogParser.query`: loading a window reads
-locally when it is already covered and fetches only the ranges that are
-missing. There is no separate "offline" mode, because `query` already makes
-that decision.
+For a look around with synthetic data and no configuration:
 
-Arguments are forwarded to Streamlit, so `python -m log_parser --server.port 8600`
-works.
-
-### Where the data comes from
-
-The sidebar picks a **fetcher** — the `fetch_fn` the parser calls for missing
-ranges. A built-in `demo (synthetic)` generator ships with it, so the UI is
-usable immediately with no configuration and no network.
-
-To point it at a real source, register your own in `log_parser/fetchers.py`:
-
-```python
-from log_parser.fetchers import ConfigField, Fetcher, register
-
-def _build(config):
-    def fetch_fn(t1, t2):
-        ...                        # return records with ts in [t1, t2]
-    return fetch_fn
-
-register(Fetcher(
-    name="my source",
-    description="Reads from ...",
-    config_fields=[ConfigField("url", "Base URL", default="https://...")],
-    build=_build,
-))
+```bash
+pip install "log-parser[ui] @ git+https://github.com/<user>/<repo>.git"
+python -m log_parser
 ```
 
-Its `config_fields` are rendered as sidebar widgets automatically. Records that
-lack a string `message`, an int `ts`, or a string `source_key` are dropped
-before ingestion and reported in the UI, so one malformed record cannot abort
-an otherwise good fetch.
+### Pointing it at your logs
+
+Write your own `app.py`. `log_parser` is an ordinary import, and your fetcher is
+passed *into* the app — nothing is registered globally and there is no file
+inside the package to edit:
+
+```python
+# app.py
+from log_parser import ConfigField, Fetcher, run_app
+
+def build_fetcher(config):
+    base_url = config["base_url"]          # from the sidebar widgets below
+
+    def fetch_fn(t1, t2):
+        # Return every record whose ts falls in [t1, t2] (inclusive, UTC epoch).
+        return [
+            {"message": hit["msg"],
+             "ts": int(hit["timestamp"]),
+             "source_key": f'{hit["cluster"]}|{hit["host"]}',
+             "extra": {"level": hit["level"]}}
+            for hit in my_client.search(base_url, t1, t2)
+        ]
+
+    return fetch_fn
+
+run_app(
+    Fetcher(
+        name="my source",
+        description="Reads from the prod log API.",
+        build=build_fetcher,
+        config_fields=[ConfigField("base_url", "Base URL", default="https://...")],
+    ),
+    title="prod logs",
+)
+```
+
+```bash
+streamlit run app.py
+```
+
+There is a ready-to-edit copy in [app.py](app.py). Streamlit options work as
+usual (`streamlit run app.py --server.port 8600`); `python -m log_parser`
+forwards them too.
+
+`build(config)` is split from `fetch_fn` so an expensive client is constructed
+once per settings change rather than once per fetch. `config_fields` render as
+sidebar widgets automatically.
+
+The app is a plain frontend to `LogParser.query`: loading a window reads locally
+when it is already covered and fetches only the ranges that are missing. There
+is no separate "offline" mode, because `query` already makes that decision.
+
+**One app reads one source.** The store records *that* a window was fetched, not
+which source answered, so two sources sharing an `events.db` would let one's
+coverage mask the other's gaps. For a second source, use a second script with its
+own `db_path`.
+
+Records that lack a string `message`, an int `ts`, or a string `source_key` are
+dropped before ingestion and reported in the UI, so one malformed record cannot
+abort an otherwise good fetch.
 
 Note that `log_parser.ui` is the only module that imports Streamlit — `import
 log_parser` never does, so the parser keeps working wherever the `ui` extra is
-not installed.
+not installed. `run_app` is re-exported from `log_parser` but resolved lazily, so
+importing it is what pulls Streamlit in, not importing the parser.
 
 ## Development
 
