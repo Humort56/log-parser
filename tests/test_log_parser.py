@@ -42,12 +42,14 @@ def test_ingestion_records_correctly(tmp_path):
     for record in records:
         assert parser.ingest(record) is True
 
-    rows = sqlite3.connect(str(tmp_path / "events.db")).execute(
-        "SELECT ts, template_id, source_key, extra FROM events ORDER BY ts"
-    ).fetchall()
+    rows = (
+        sqlite3.connect(str(tmp_path / "events.db"))
+        .execute("SELECT ts, template_id, source_key, extra FROM events ORDER BY ts")
+        .fetchall()
+    )
 
     assert len(rows) == len(records)
-    for row, expected in zip(rows, records):
+    for row, expected in zip(rows, records, strict=True):
         ts, template_id, source_key, extra = row
         assert ts == expected["ts"]
         assert isinstance(template_id, int) and template_id > 0
@@ -132,18 +134,22 @@ def test_template_counts_and_ts_bounds(tmp_path):
 
     # Three "logged in" lines share a template; one disk line is its own.
     for i, ts in enumerate((100, 200, 300)):
-        parser.ingest({
-            "message": f"User {i} logged in from 10.0.0.{i}",
-            "ts": ts,
-            "source_key": "clientA|server1",
+        parser.ingest(
+            {
+                "message": f"User {i} logged in from 10.0.0.{i}",
+                "ts": ts,
+                "source_key": "clientA|server1",
+                "extra": {},
+            }
+        )
+    parser.ingest(
+        {
+            "message": "Disk sda full at 91%",
+            "ts": 400,
+            "source_key": "clientA|server2",
             "extra": {},
-        })
-    parser.ingest({
-        "message": "Disk sda full at 91%",
-        "ts": 400,
-        "source_key": "clientA|server2",
-        "extra": {},
-    })
+        }
+    )
 
     counts = store.template_counts(0, 10_000)
     assert [n for _, n in counts] == [3, 1], "most frequent template first"

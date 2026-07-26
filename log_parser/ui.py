@@ -9,8 +9,9 @@ your code rather than in an installed file that an upgrade overwrites::
     run_app(Fetcher(name="prod", description="...", build=build_prod),
             title="prod logs")
 
-then ``streamlit run app.py``. ``python -m log_parser`` runs the same app with a
-synthetic demo source, for a look around before wiring anything real.
+then ``streamlit run app.py``. ``log-parser`` (or ``python -m log_parser``) runs
+the same app with a synthetic demo source, for a look around before wiring
+anything real.
 
 The app is a plain frontend to :meth:`LogParser.query`: every window the user
 loads goes through it, and V1 decides on its own whether that means reading
@@ -27,21 +28,28 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import sqlite3
 import traceback
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import streamlit as st
 
 from log_parser.core import (
     DEFAULT_MARGIN_SEC,
+    FetchFn,
     LogParser,
     Record,
     SqliteStore,
     TemplateModel,
 )
 from log_parser.fetchers import Fetcher, validated
+
+logger = logging.getLogger(__name__)
 
 UTC = dt.timezone.utc
 ANY_KEY = "— any —"
@@ -52,6 +60,7 @@ UNKNOWN_TEMPLATE = "⟨unknown template {tid}⟩"
 # --------------------------------------------------------------------------
 # Pure helpers -- no streamlit, no I/O. Everything here is unit-tested.
 # --------------------------------------------------------------------------
+
 
 def to_epoch(date: dt.date, time: dt.time) -> int:
     """Combine a UTC date and time into a Unix epoch second.
@@ -82,18 +91,18 @@ def render_value(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
-def discover_extra_keys(rows: Sequence[Record]) -> List[str]:
+def discover_extra_keys(rows: Sequence[Record]) -> list[str]:
     """Top-level ``extra`` keys present in ``rows``, most common first."""
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for row in rows:
         for key in row.get("extra") or {}:
             counts[key] = counts.get(key, 0) + 1
     return sorted(counts, key=lambda k: (-counts[k], k))
 
 
-def extra_values_for_key(rows: Sequence[Record], key: str) -> List[str]:
+def extra_values_for_key(rows: Sequence[Record], key: str) -> list[str]:
     """Distinct JSON-rendered values of ``extra[key]``, most common first."""
-    counts: Dict[str, int] = {}
+    counts: dict[str, int] = {}
     for row in rows:
         extra = row.get("extra") or {}
         if key in extra:
@@ -109,18 +118,20 @@ def row_haystack(row: Record, template_text: str) -> str:
     holds only ``template_id`` -- so a search for words the user remembers
     seeing would otherwise never match anything.
     """
-    return " ".join((
-        template_text,
-        row.get("source_key", ""),
-        render_value(row.get("extra") or {}),
-    )).lower()
+    return " ".join(
+        (
+            template_text,
+            row.get("source_key", ""),
+            render_value(row.get("extra") or {}),
+        )
+    ).lower()
 
 
 def row_matches_filters(
     row: Record,
     template_text: str,
     *,
-    extra_key: Optional[str] = None,
+    extra_key: str | None = None,
     extra_values: Sequence[str] = (),
     query: str = "",
     source_keys: Sequence[str] = (),
@@ -138,39 +149,44 @@ def row_matches_filters(
         if extra_values and render_value(extra[extra_key]) not in extra_values:
             return False
 
-    if query and query.lower() not in row_haystack(row, template_text):
+    # The sequence of early returns mirrors the filter order and reads better
+    # than collapsing this last one into a negated compound expression.
+    if query and query.lower() not in row_haystack(row, template_text):  # noqa: SIM103
         return False
 
     return True
 
 
 def rows_to_dataframe(
-    rows: Sequence[Record], templates: Dict[int, Tuple[str, int]]
+    rows: Sequence[Record], templates: dict[int, tuple[str, int]]
 ) -> pd.DataFrame:
     """Build the events table. Unknown template ids degrade, never raise."""
-    return pd.DataFrame([
-        {
-            "time_utc": format_ts(row["ts"]),
-            "ts": row["ts"],
-            "template_id": row["template_id"],
-            "template": templates.get(
-                row["template_id"], (UNKNOWN_TEMPLATE.format(tid=row["template_id"]), 0)
-            )[0],
-            "source_key": row["source_key"],
-            "extra": render_value(row.get("extra") or {}),
-        }
-        for row in rows
-    ], columns=["time_utc", "ts", "template_id", "template", "source_key", "extra"])
+    return pd.DataFrame(
+        [
+            {
+                "time_utc": format_ts(row["ts"]),
+                "ts": row["ts"],
+                "template_id": row["template_id"],
+                "template": templates.get(
+                    row["template_id"], (UNKNOWN_TEMPLATE.format(tid=row["template_id"]), 0)
+                )[0],
+                "source_key": row["source_key"],
+                "extra": render_value(row.get("extra") or {}),
+            }
+            for row in rows
+        ],
+        columns=["time_utc", "ts", "template_id", "template", "source_key", "extra"],
+    )
 
 
 def template_table(
-    counts: Sequence[Tuple[int, int]],
-    templates: Dict[int, Tuple[str, int]],
+    counts: Sequence[tuple[int, int]],
+    templates: dict[int, tuple[str, int]],
     filtered_rows: Sequence[Record],
 ) -> pd.DataFrame:
     """Per-template summary for the window, most frequent first."""
-    filtered_counts: Dict[int, int] = {}
-    spans: Dict[int, Tuple[int, int]] = {}
+    filtered_counts: dict[int, int] = {}
+    spans: dict[int, tuple[int, int]] = {}
     for row in filtered_rows:
         tid, ts = row["template_id"], row["ts"]
         filtered_counts[tid] = filtered_counts.get(tid, 0) + 1
@@ -181,26 +197,37 @@ def template_table(
     for tid, count in counts:
         text, all_time = templates.get(tid, (UNKNOWN_TEMPLATE.format(tid=tid), 0))
         span = spans.get(tid)
-        records.append({
-            "template_id": tid,
-            "template": text,
-            "count_in_window": count,
-            "count_filtered": filtered_counts.get(tid, 0),
-            "first_seen_utc": format_ts(span[0]) if span else "",
-            "last_seen_utc": format_ts(span[1]) if span else "",
-            "drain3_all_time_size": all_time,
-        })
-    return pd.DataFrame(records, columns=[
-        "template_id", "template", "count_in_window", "count_filtered",
-        "first_seen_utc", "last_seen_utc", "drain3_all_time_size",
-    ])
+        records.append(
+            {
+                "template_id": tid,
+                "template": text,
+                "count_in_window": count,
+                "count_filtered": filtered_counts.get(tid, 0),
+                "first_seen_utc": format_ts(span[0]) if span else "",
+                "last_seen_utc": format_ts(span[1]) if span else "",
+                "drain3_all_time_size": all_time,
+            }
+        )
+    return pd.DataFrame(
+        records,
+        columns=[
+            "template_id",
+            "template",
+            "count_in_window",
+            "count_filtered",
+            "first_seen_utc",
+            "last_seen_utc",
+            "drain3_all_time_size",
+        ],
+    )
 
 
 # --------------------------------------------------------------------------
 # Data access
 # --------------------------------------------------------------------------
 
-def load_templates(state_path: str) -> Dict[int, Tuple[str, int]]:
+
+def load_templates(state_path: str) -> dict[int, tuple[str, int]]:
     """``{cluster_id: (template_text, all_time_size)}`` from the Drain3 snapshot.
 
     Constructing a TemplateModel neither creates nor rewrites the snapshot; only
@@ -209,18 +236,35 @@ def load_templates(state_path: str) -> Dict[int, Tuple[str, int]]:
     foreign or truncated snapshot should cost the template *text*, not the page.
     """
     try:
-        model = TemplateModel(state_path)
-        return {
-            cluster.cluster_id: (cluster.get_template(), cluster.size)
-            for cluster in model._miner.drain.clusters
-        }
-    except Exception:  # noqa: BLE001 -- unpickling can fail in many ways
+        return TemplateModel(state_path).clusters()
+    except Exception:
+        # Swallowed deliberately (see above), but never silently: without a log
+        # line a corrupt snapshot is indistinguishable from an empty one, and
+        # the page only shows the consequence.
+        logger.warning("Could not read Drain3 snapshot %s", state_path, exc_info=True)
         return {}
 
 
+@dataclass(frozen=True)
+class QueryResult:
+    """Everything one loaded window gives the page.
+
+    A dataclass rather than a dict so a mistyped field is an error at the call
+    site instead of a ``KeyError`` halfway down the render.
+    """
+
+    rows: list[Record]
+    counts: list[tuple[int, int]]
+    bounds: tuple[int, int] | None
+    total: int
+    gaps: list[tuple[int, int]]
+    skipped: int
+    templates: dict[int, tuple[str, int]]
+
+
 def run_query(
-    fetch_fn, db_path: str, state_path: str, margin_sec: int, t1: int, t2: int
-) -> Dict[str, Any]:
+    fetch_fn: FetchFn, db_path: str, state_path: str, margin_sec: int, t1: int, t2: int
+) -> QueryResult:
     """Query ``[t1, t2]`` through V1, then read back what the UI needs.
 
     Opens a parser, queries, and closes -- ``close()`` saves the Drain3 tree, and
@@ -228,40 +272,36 @@ def run_query(
     would strand every template learned during the session and leave the stored
     rows pointing at cluster ids the snapshot has never heard of.
     """
-    skipped: List[Record] = []
-    parser = LogParser(
+    skipped: list[Record] = []
+    # The context manager closes even when fetch_fn raised: V1 has already
+    # ingested whatever arrived before the failure, and those rows need their
+    # templates saved.
+    with LogParser(
         fetch_fn=validated(fetch_fn, skipped),
         db_path=db_path,
         state_path=state_path,
         margin_sec=margin_sec,
-    )
-    try:
+    ) as parser:
         gaps = parser.store.missing(t1, t2)
         rows = parser.query(t1, t2)
         counts = parser.store.template_counts(t1, t2)
         bounds = parser.store.ts_bounds()
         total = parser.store.count_events()
-    finally:
-        # Runs even when fetch_fn raised: V1 has already ingested whatever
-        # arrived before the failure, and those rows need their templates saved.
-        parser.close()
 
-    return {
-        "rows": rows,
-        "counts": counts,
-        "bounds": bounds,
-        "total": total,
-        "gaps": gaps,
-        "skipped": len(skipped),
-        "templates": load_templates(state_path),
-    }
+    return QueryResult(
+        rows=rows,
+        counts=counts,
+        bounds=bounds,
+        total=total,
+        gaps=gaps,
+        skipped=len(skipped),
+        templates=load_templates(state_path),
+    )
 
 
-def peek_store(db_path: str) -> Optional[Dict[str, Any]]:
+def peek_store(db_path: str) -> dict[str, Any] | None:
     """Cheap status read for the sidebar; ``None`` when there is no store yet."""
-    import os
-
-    if not os.path.exists(db_path):
+    if not Path(db_path).exists():
         return None
     store = SqliteStore(db_path)
     try:
@@ -278,32 +318,40 @@ def peek_store(db_path: str) -> Optional[Dict[str, Any]]:
 # UI
 # --------------------------------------------------------------------------
 
-def _sidebar_fetcher(fetcher: Fetcher) -> Tuple[Any, str]:
+
+def _sidebar_fetcher(fetcher: Fetcher) -> tuple[Any, str]:
     st.sidebar.subheader("Source")
     st.sidebar.caption(f"**{fetcher.name}** — {fetcher.description}")
 
-    config: Dict[str, Any] = {}
+    config: dict[str, Any] = {}
     for field in fetcher.config_fields:
         widget_key = f"cfg_{fetcher.name}_{field.key}"
         if field.kind == "int":
             config[field.key] = st.sidebar.number_input(
-                field.label, value=int(field.default), step=1,
-                help=field.help or None, key=widget_key,
+                field.label,
+                value=int(field.default),
+                step=1,
+                help=field.help or None,
+                key=widget_key,
             )
         elif field.kind == "float":
             config[field.key] = st.sidebar.number_input(
-                field.label, value=float(field.default),
-                help=field.help or None, key=widget_key,
+                field.label,
+                value=float(field.default),
+                help=field.help or None,
+                key=widget_key,
             )
         else:
             config[field.key] = st.sidebar.text_input(
-                field.label, value=str(field.default),
-                help=field.help or None, key=widget_key,
+                field.label,
+                value=str(field.default),
+                help=field.help or None,
+                key=widget_key,
             )
     return fetcher.build(config), fetcher.name
 
 
-def _sidebar_window(status: Optional[Dict[str, Any]]) -> Tuple[int, int]:
+def _sidebar_window(status: dict[str, Any] | None) -> tuple[int, int]:
     st.sidebar.subheader("Time window (UTC)")
 
     if status and status.get("bounds"):
@@ -327,26 +375,28 @@ def _sidebar_window(status: Optional[Dict[str, Any]]) -> Tuple[int, int]:
     return t1, t2
 
 
-def _sidebar_filters(rows: Sequence[Record]) -> Dict[str, Any]:
+def _sidebar_filters(rows: Sequence[Record]) -> dict[str, Any]:
     st.sidebar.subheader("Filters")
     if not rows:
         st.sidebar.caption("Load a window to filter it.")
         return {}
 
     keys = discover_extra_keys(rows)
-    extra_key = st.sidebar.selectbox("extra key", [ANY_KEY] + keys)
-    extra_values: List[str] = []
+    extra_key = st.sidebar.selectbox("extra key", [ANY_KEY, *keys])
+    extra_values: list[str] = []
     if extra_key != ANY_KEY:
         options = extra_values_for_key(rows, extra_key)
         extra_values = st.sidebar.multiselect(
-            f"{extra_key} is", options,
+            f"{extra_key} is",
+            options,
             help="Values are shown as JSON, matching how they are stored.",
         )
 
     sources = sorted({row["source_key"] for row in rows})
     source_keys = st.sidebar.multiselect("source_key", sources)
     query = st.sidebar.text_input(
-        "Search", help="Matches template text, source_key and extra (case-insensitive).",
+        "Search",
+        help="Matches template text, source_key and extra (case-insensitive).",
     )
     return {
         "extra_key": extra_key,
@@ -354,6 +404,188 @@ def _sidebar_filters(rows: Sequence[Record]) -> Dict[str, Any]:
         "query": query,
         "source_keys": source_keys,
     }
+
+
+def _sidebar_store(db_path: str, state_path: str) -> tuple[str, str, int]:
+    """The store inputs. Returns the (possibly edited) paths and margin."""
+    st.sidebar.subheader("Store")
+    db_path = st.sidebar.text_input("Database", db_path)
+    state_path = st.sidebar.text_input("Drain3 snapshot", state_path)
+    margin_sec = st.sidebar.number_input(
+        "Fetch margin (s)",
+        value=DEFAULT_MARGIN_SEC,
+        min_value=0,
+        step=10,
+        help="Gaps are fetched padded by this much; the un-padded gap is recorded.",
+    )
+    return db_path, state_path, int(margin_sec)
+
+
+def _render_store_status(db_path: str, status: dict[str, Any] | None) -> None:
+    if status is None:
+        st.sidebar.caption(f"`{db_path}` — not found (created on first load)")
+        return
+    span = ""
+    if status["bounds"]:
+        span = f" · {format_ts(status['bounds'][0])} → {format_ts(status['bounds'][1])}"
+    st.sidebar.caption(f"`{db_path}` — {status['total']:,} events{span}")
+
+
+def _load_window(
+    fetch_fn: FetchFn,
+    db_path: str,
+    state_path: str,
+    margin_sec: int,
+    t1: int,
+    t2: int,
+    cache_key: tuple[Any, ...],
+) -> None:
+    """Run the query, storing the result or the error in session state."""
+    with st.spinner(f"Querying {format_ts(t1)} → {format_ts(t2)} (UTC)…"):
+        try:
+            st.session_state["result"] = run_query(
+                fetch_fn, db_path, state_path, margin_sec, t1, t2
+            )
+            st.session_state["cache_key"] = cache_key
+            st.session_state.pop("error", None)
+        except sqlite3.OperationalError as exc:
+            logger.warning("SQLite unavailable for %s: %s", db_path, exc)
+            st.session_state["error"] = (
+                f"SQLite is busy or unavailable: {exc}. "
+                "Another process may be writing to this database.",
+                "",
+            )
+        except Exception as exc:
+            # Deliberately broad: arbitrary third-party fetcher code runs under
+            # this. Also logged, because the browser tab shows this but whoever
+            # is watching the terminal should not have to ask what it said.
+            logger.exception("Query failed for window [%d, %d]", t1, t2)
+            st.session_state["error"] = (
+                f"The fetcher failed: {exc}",
+                traceback.format_exc(),
+            )
+
+
+def _render_error() -> None:
+    if "error" not in st.session_state:
+        return
+    message, detail = st.session_state["error"]
+    st.error(message)
+    if detail:
+        with st.expander("Details"):
+            st.code(detail)
+    st.caption(
+        "Records fetched before the failure were stored, and their ranges "
+        "recorded — loading again resumes from the gap that remains."
+    )
+
+
+def _apply_filters(
+    rows: Sequence[Record],
+    templates: dict[int, tuple[str, int]],
+    filters: dict[str, Any],
+) -> list[Record]:
+    """Filter loaded rows in memory -- no I/O, so typing cannot trigger a fetch."""
+    return [
+        row
+        for row in rows
+        if row_matches_filters(
+            row,
+            templates.get(row["template_id"], ("", 0))[0],
+            extra_key=filters.get("extra_key"),
+            extra_values=filters.get("extra_values", ()),
+            query=filters.get("query", ""),
+            source_keys=filters.get("source_keys", ()),
+        )
+    ]
+
+
+def _render_warnings(result: QueryResult, state_path: str) -> None:
+    if result.skipped:
+        st.warning(
+            f"{result.skipped:,} malformed record(s) from the fetcher were "
+            "skipped: each must have a string `message`, an int `ts` and a "
+            "string `source_key`."
+        )
+
+    unknown = {r["template_id"] for r in result.rows} - set(result.templates)
+    if unknown:
+        st.warning(
+            f"{len(unknown)} template id(s) in this window are absent from "
+            f"`{state_path}` — is it the snapshot that goes with this database?"
+        )
+
+
+def _render_metrics(result: QueryResult, filtered: Sequence[Record]) -> None:
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("In window", f"{len(result.rows):,}")
+    col2.metric("After filters", f"{len(filtered):,}")
+    col3.metric("Templates", f"{len(result.counts):,}")
+    col4.metric("Gaps fetched", f"{len(result.gaps):,}")
+    if result.gaps:
+        st.caption(
+            "Fetched: " + ", ".join(f"{format_ts(a)} → {format_ts(b)}" for a, b in result.gaps)
+        )
+
+
+def _render_events_tab(result: QueryResult, filtered: Sequence[Record], t1: int, t2: int) -> None:
+    if not result.rows:
+        if result.total and result.bounds:
+            st.info(
+                f"No events in this window. The store spans "
+                f"{format_ts(result.bounds[0])} → {format_ts(result.bounds[1])} (UTC)."
+            )
+        else:
+            st.info("No events stored yet for this window.")
+        return
+    if not filtered:
+        st.info(f"{len(result.rows):,} events in the window, none match the filters.")
+        return
+
+    capped = filtered[:DEFAULT_ROW_CAP]
+    if len(filtered) > DEFAULT_ROW_CAP:
+        st.warning(
+            f"Showing the first {DEFAULT_ROW_CAP:,} of {len(filtered):,} "
+            "matching events — narrow the window. The CSV download "
+            "still contains every match."
+        )
+    st.dataframe(
+        rows_to_dataframe(capped, result.templates),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "template": st.column_config.TextColumn("template", width="large"),
+            "extra": st.column_config.TextColumn("extra", width="large"),
+        },
+    )
+    st.download_button(
+        "Download filtered as CSV",
+        rows_to_dataframe(filtered, result.templates).to_csv(index=False).encode(),
+        file_name=f"events_{t1}_{t2}.csv",
+        mime="text/csv",
+    )
+
+
+def _render_templates_tab(result: QueryResult, filtered: Sequence[Record]) -> None:
+    if not result.counts:
+        st.info("No templates in this window.")
+        return
+    st.dataframe(
+        template_table(result.counts, result.templates, filtered),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "template": st.column_config.TextColumn("template", width="large"),
+            "drain3_all_time_size": st.column_config.NumberColumn(
+                "drain3 all-time",
+                help=(
+                    "Drain3's own counter from the snapshot: all-time "
+                    "across every window, not scoped to this one. "
+                    "SQLite is the source of truth for occurrences."
+                ),
+            ),
+        },
+    )
 
 
 def run_app(
@@ -380,6 +612,8 @@ def run_app(
     The path arguments only seed the sidebar inputs; the user can still change
     them at runtime.
     """
+    # Before any streamlit call: a bad argument must raise TypeError rather
+    # than fail somewhere inside the page render.
     if not isinstance(fetcher, Fetcher):
         raise TypeError(
             f"run_app() takes a single Fetcher, got {type(fetcher).__name__}. "
@@ -388,22 +622,9 @@ def run_app(
     st.set_page_config(page_title=title, page_icon=icon, layout="wide")
     st.title(f"{icon} {title}")
 
-    st.sidebar.subheader("Store")
-    db_path = st.sidebar.text_input("Database", db_path)
-    state_path = st.sidebar.text_input("Drain3 snapshot", state_path)
-    margin_sec = st.sidebar.number_input(
-        "Fetch margin (s)", value=DEFAULT_MARGIN_SEC, min_value=0, step=10,
-        help="Gaps are fetched padded by this much; the un-padded gap is recorded.",
-    )
-
+    db_path, state_path, margin_sec = _sidebar_store(db_path, state_path)
     status = peek_store(db_path)
-    if status is None:
-        st.sidebar.caption(f"`{db_path}` — not found (created on first load)")
-    else:
-        span = ""
-        if status["bounds"]:
-            span = f" · {format_ts(status['bounds'][0])} → {format_ts(status['bounds'][1])}"
-        st.sidebar.caption(f"`{db_path}` — {status['total']:,} events{span}")
+    _render_store_status(db_path, status)
 
     fetch_fn, fetcher_name = _sidebar_fetcher(fetcher)
     t1, t2 = _sidebar_window(status)
@@ -415,44 +636,18 @@ def run_app(
         st.stop()
 
     load = st.sidebar.button("Load window", type="primary", width="stretch")
-    st.sidebar.caption(
-        "Loading queries the store and fetches any ranges it is missing."
-    )
+    st.sidebar.caption("Loading queries the store and fetches any ranges it is missing.")
 
-    cache_key = (db_path, state_path, int(margin_sec), t1, t2, fetcher_name)
+    cache_key = (db_path, state_path, margin_sec, t1, t2, fetcher_name)
     if st.session_state.get("cache_key") not in (None, cache_key):
         st.sidebar.caption("⚠️ Settings changed — press Load window to refresh.")
 
     if load:
-        with st.spinner(f"Querying {format_ts(t1)} → {format_ts(t2)} (UTC)…"):
-            try:
-                st.session_state["result"] = run_query(
-                    fetch_fn, db_path, state_path, int(margin_sec), t1, t2
-                )
-                st.session_state["cache_key"] = cache_key
-                st.session_state.pop("error", None)
-            except sqlite3.OperationalError as exc:
-                st.session_state["error"] = (
-                    f"SQLite is busy or unavailable: {exc}. "
-                    "Another process may be writing to this database.", "",
-                )
-            except Exception as exc:  # noqa: BLE001 -- surfaced, not swallowed
-                st.session_state["error"] = (
-                    f"The fetcher failed: {exc}", traceback.format_exc(),
-                )
+        _load_window(fetch_fn, db_path, state_path, margin_sec, t1, t2, cache_key)
 
-    if "error" in st.session_state:
-        message, detail = st.session_state["error"]
-        st.error(message)
-        if detail:
-            with st.expander("Details"):
-                st.code(detail)
-        st.caption(
-            "Records fetched before the failure were stored, and their ranges "
-            "recorded — loading again resumes from the gap that remains."
-        )
+    _render_error()
 
-    result = st.session_state.get("result")
+    result: QueryResult | None = st.session_state.get("result")
     if result is None:
         st.info(
             "Pick a time window in the sidebar and press **Load window**. "
@@ -460,102 +655,17 @@ def run_app(
         )
         return
 
-    rows, templates = result["rows"], result["templates"]
-    filters = _sidebar_filters(rows)
-    # Filtering runs over the rows already loaded: no I/O, so typing in the
-    # search box cannot trigger a remote fetch on every keystroke.
-    filtered = [
-        row for row in rows
-        if row_matches_filters(
-            row,
-            templates.get(row["template_id"], ("", 0))[0],
-            extra_key=filters.get("extra_key"),
-            extra_values=filters.get("extra_values", ()),
-            query=filters.get("query", ""),
-            source_keys=filters.get("source_keys", ()),
-        )
-    ]
+    filters = _sidebar_filters(result.rows)
+    filtered = _apply_filters(result.rows, result.templates, filters)
 
-    if result["skipped"]:
-        st.warning(
-            f"{result['skipped']:,} malformed record(s) from the fetcher were "
-            "skipped: each must have a string `message`, an int `ts` and a "
-            "string `source_key`."
-        )
-
-    unknown = {r["template_id"] for r in rows} - set(templates)
-    if unknown:
-        st.warning(
-            f"{len(unknown)} template id(s) in this window are absent from "
-            f"`{state_path}` — is it the snapshot that goes with this database?"
-        )
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("In window", f"{len(rows):,}")
-    col2.metric("After filters", f"{len(filtered):,}")
-    col3.metric("Templates", f"{len(result['counts']):,}")
-    col4.metric("Gaps fetched", f"{len(result['gaps']):,}")
-    if result["gaps"]:
-        st.caption("Fetched: " + ", ".join(
-            f"{format_ts(a)} → {format_ts(b)}" for a, b in result["gaps"]
-        ))
+    _render_warnings(result, state_path)
+    _render_metrics(result, filtered)
 
     events_tab, templates_tab = st.tabs(["Events", "Templates"])
-
     with events_tab:
-        if not rows:
-            bounds = result["bounds"]
-            if result["total"] and bounds:
-                st.info(
-                    f"No events in this window. The store spans "
-                    f"{format_ts(bounds[0])} → {format_ts(bounds[1])} (UTC)."
-                )
-            else:
-                st.info("No events stored yet for this window.")
-        elif not filtered:
-            st.info(f"{len(rows):,} events in the window, none match the filters.")
-        else:
-            capped = filtered[:DEFAULT_ROW_CAP]
-            if len(filtered) > DEFAULT_ROW_CAP:
-                st.warning(
-                    f"Showing the first {DEFAULT_ROW_CAP:,} of {len(filtered):,} "
-                    "matching events — narrow the window. The CSV download "
-                    "still contains every match."
-                )
-            frame = rows_to_dataframe(capped, templates)
-            st.dataframe(
-                frame, width="stretch", hide_index=True,
-                column_config={
-                    "template": st.column_config.TextColumn("template", width="large"),
-                    "extra": st.column_config.TextColumn("extra", width="large"),
-                },
-            )
-            st.download_button(
-                "Download filtered as CSV",
-                rows_to_dataframe(filtered, templates).to_csv(index=False).encode(),
-                file_name=f"events_{t1}_{t2}.csv",
-                mime="text/csv",
-            )
-
+        _render_events_tab(result, filtered, t1, t2)
     with templates_tab:
-        if not result["counts"]:
-            st.info("No templates in this window.")
-        else:
-            st.dataframe(
-                template_table(result["counts"], templates, filtered),
-                width="stretch", hide_index=True,
-                column_config={
-                    "template": st.column_config.TextColumn("template", width="large"),
-                    "drain3_all_time_size": st.column_config.NumberColumn(
-                        "drain3 all-time",
-                        help=(
-                            "Drain3's own counter from the snapshot: all-time "
-                            "across every window, not scoped to this one. "
-                            "SQLite is the source of truth for occurrences."
-                        ),
-                    ),
-                },
-            )
+        _render_templates_tab(result, filtered)
 
 
 if __name__ == "__main__":

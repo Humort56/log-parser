@@ -19,6 +19,8 @@ streamlit, so it is resolved lazily by ``__getattr__`` below. That keeps
 ``import log_parser`` still costs nothing for a pipeline that never renders.
 """
 
+import logging
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
 from log_parser.core import (
@@ -37,6 +39,16 @@ from log_parser.fetchers import ConfigField, Fetcher
 if TYPE_CHECKING:  # For type checkers only -- never executed at runtime.
     from log_parser.ui import run_app
 
+try:
+    __version__ = version("log-parser")
+except PackageNotFoundError:  # Running from a source tree that was never installed.
+    __version__ = "0.0.0+unknown"
+
+# A library configures no handlers of its own: without this, a consuming app
+# that never set up logging would print "No handlers could be found" the first
+# time this package logged anything.
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
 __all__ = [
     "DEFAULT_MARGIN_SEC",
     "ConfigField",
@@ -47,6 +59,7 @@ __all__ = [
     "Record",
     "SqliteStore",
     "TemplateModel",
+    "__version__",
     "merge_ranges",
     "missing_ranges",
     "run_app",

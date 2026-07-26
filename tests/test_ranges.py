@@ -6,14 +6,16 @@ means either a phantom gap (a pointless remote fetch) or a swallowed gap
 (silently missing events).
 """
 
+from itertools import pairwise
+
 import pytest
 
 from log_parser import merge_ranges, missing_ranges
 
-
 # --------------------------------------------------------------------------
 # merge_ranges
 # --------------------------------------------------------------------------
+
 
 @pytest.mark.parametrize(
     "ranges, expected",
@@ -53,6 +55,7 @@ def test_merge_ranges_does_not_mutate_input():
 # missing_ranges
 # --------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize(
     "t1, t2, covered, expected",
     [
@@ -89,7 +92,7 @@ def test_missing_ranges(t1, t2, covered, expected):
 def test_missing_ranges_gaps_are_disjoint_and_ordered():
     gaps = missing_ranges(0, 1000, [(100, 200), (500, 600), (800, 850)])
     assert gaps == [(0, 99), (201, 499), (601, 799), (851, 1000)]
-    for (_, prev_end), (next_start, _) in zip(gaps, gaps[1:]):
+    for (_, prev_end), (next_start, _) in pairwise(gaps):
         assert prev_end < next_start
 
 

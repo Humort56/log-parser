@@ -13,8 +13,8 @@ import pytest
 
 pytest.importorskip("streamlit")
 
-from log_parser.fetchers import validated  # noqa: E402
-from log_parser.ui import (  # noqa: E402
+from log_parser.fetchers import validated
+from log_parser.ui import (
     ANY_KEY,
     UNKNOWN_TEMPLATE,
     discover_extra_keys,
@@ -43,6 +43,7 @@ def make_row(ts=1_700_000_000, template_id=1, source_key="clientA|server1", extr
 # --------------------------------------------------------------------------
 # Time
 # --------------------------------------------------------------------------
+
 
 def test_to_epoch_is_utc():
     # 2023-11-14 22:13:20 UTC == 1700000000
@@ -79,6 +80,7 @@ def test_time_helpers_ignore_local_timezone(monkeypatch, tz):
 # --------------------------------------------------------------------------
 # extra rendering and discovery
 # --------------------------------------------------------------------------
+
 
 def test_render_value_uses_json_not_python_repr():
     """A str() rendering would produce ['a', 'b'] and never match the stored JSON."""
@@ -127,6 +129,7 @@ def test_extra_values_for_key_renders_nested_as_json():
 # --------------------------------------------------------------------------
 # Filtering
 # --------------------------------------------------------------------------
+
 
 def test_no_filters_matches_everything():
     assert row_matches_filters(make_row(), "User <*> logged in") is True
@@ -182,15 +185,29 @@ def test_source_key_filter():
 
 def test_filters_are_anded():
     row = make_row(source_key="clientA|server1", extra={"level": "INFO"})
-    assert row_matches_filters(
-        row, "Disk full", extra_key="level", extra_values=['"INFO"'],
-        query="disk", source_keys=["clientA|server1"],
-    ) is True
+    assert (
+        row_matches_filters(
+            row,
+            "Disk full",
+            extra_key="level",
+            extra_values=['"INFO"'],
+            query="disk",
+            source_keys=["clientA|server1"],
+        )
+        is True
+    )
     # One failing predicate is enough to reject.
-    assert row_matches_filters(
-        row, "Disk full", extra_key="level", extra_values=['"INFO"'],
-        query="disk", source_keys=["clientB|server2"],
-    ) is False
+    assert (
+        row_matches_filters(
+            row,
+            "Disk full",
+            extra_key="level",
+            extra_values=['"INFO"'],
+            query="disk",
+            source_keys=["clientB|server2"],
+        )
+        is False
+    )
 
 
 def test_haystack_is_lowercased_and_includes_all_parts():
@@ -206,11 +223,17 @@ def test_haystack_is_lowercased_and_includes_all_parts():
 # Table building
 # --------------------------------------------------------------------------
 
+
 def test_rows_to_dataframe_columns_and_values():
     rows = [make_row(ts=1_700_000_000, template_id=7, extra={"level": "INFO"})]
     frame = rows_to_dataframe(rows, {7: ("User <*> logged in", 3)})
     assert list(frame.columns) == [
-        "time_utc", "ts", "template_id", "template", "source_key", "extra",
+        "time_utc",
+        "ts",
+        "template_id",
+        "template",
+        "source_key",
+        "extra",
     ]
     row = frame.iloc[0]
     assert row["time_utc"] == "2023-11-14 22:13:20"
@@ -227,7 +250,12 @@ def test_rows_to_dataframe_degrades_on_unknown_template():
 
 def test_rows_to_dataframe_empty_keeps_columns():
     assert list(rows_to_dataframe([], {}).columns) == [
-        "time_utc", "ts", "template_id", "template", "source_key", "extra",
+        "time_utc",
+        "ts",
+        "template_id",
+        "template",
+        "source_key",
+        "extra",
     ]
 
 
@@ -239,8 +267,8 @@ def test_template_table_counts_and_spans():
     frame = template_table(counts, templates, filtered)
     first = frame.iloc[0]
     assert first["template_id"] == 1
-    assert first["count_in_window"] == 3      # whole window
-    assert first["count_filtered"] == 2       # after filters
+    assert first["count_in_window"] == 3  # whole window
+    assert first["count_filtered"] == 2  # after filters
     assert first["first_seen_utc"] == format_ts(100)
     assert first["last_seen_utc"] == format_ts(300)
     # Drain3's own counter is reported separately from the windowed count.
@@ -255,18 +283,19 @@ def test_template_table_counts_and_spans():
 # Fetcher validation
 # --------------------------------------------------------------------------
 
+
 def test_validated_drops_malformed_records_and_counts_them():
     good = {"message": "ok", "ts": 100, "source_key": "s", "extra": {"a": 1}}
     bad = [
         {"message": "no ts", "source_key": "s"},
-        {"ts": 100, "source_key": "s"},                    # no message
+        {"ts": 100, "source_key": "s"},  # no message
         {"message": "m", "ts": "100", "source_key": "s"},  # ts not an int
-        {"message": "m", "ts": True, "source_key": "s"},   # bool is not a time
-        {"message": "m", "ts": 100},                       # no source_key
+        {"message": "m", "ts": True, "source_key": "s"},  # bool is not a time
+        {"message": "m", "ts": 100},  # no source_key
         "not a dict",
     ]
     skipped = []
-    fetch = validated(lambda t1, t2: [good] + bad, skipped)
+    fetch = validated(lambda t1, t2: [good, *bad], skipped)
 
     assert fetch(0, 1000) == [good]
     assert len(skipped) == len(bad)
@@ -289,6 +318,7 @@ def test_validated_tolerates_none_from_fetcher():
 # --------------------------------------------------------------------------
 # run_app argument handling
 # --------------------------------------------------------------------------
+
 
 def test_run_app_requires_a_fetcher():
     """Without a source every window returns empty, which reads as a bug.
@@ -320,7 +350,7 @@ def test_demo_fetcher_is_a_fresh_instance_each_call():
 
     first, second = demo_fetcher(), demo_fetcher()
     assert first is not second
-    assert first == second           # frozen dataclass: equal by value
+    assert first == second  # frozen dataclass: equal by value
     assert first.config_fields is not second.config_fields
 
 

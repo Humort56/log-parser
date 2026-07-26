@@ -8,12 +8,12 @@ Everything specific to *your* logs lives here, in your own file. `log_parser`
 stays an ordinary dependency you can upgrade without losing this code.
 """
 
-from typing import Any, Dict, List
+from typing import Any
 
-from log_parser import ConfigField, Fetcher, Record, run_app
+from log_parser import ConfigField, Fetcher, FetchFn, Record, run_app
 
 
-def build_fetcher(config: Dict[str, Any]):
+def build_fetcher(config: dict[str, Any]) -> FetchFn:
     """Return the ``fetch_fn`` the parser calls for ranges it does not have.
 
     ``config`` holds the values of the ``config_fields`` below, as edited in the
@@ -22,7 +22,7 @@ def build_fetcher(config: Dict[str, Any]):
     """
     base_url = config["base_url"]
 
-    def fetch_fn(t1: int, t2: int) -> List[Record]:
+    def fetch_fn(t1: int, t2: int) -> list[Record]:
         """Return every record whose ``ts`` falls in ``[t1, t2]`` (inclusive).
 
         Both bounds are UTC Unix epoch seconds. Fetch the whole range in one
@@ -44,9 +44,7 @@ def build_fetcher(config: Dict[str, Any]):
                 for hit in response.json()["hits"]
             ]
         """
-        raise NotImplementedError(
-            f"Implement fetch_fn to read {base_url} between {t1} and {t2}."
-        )
+        raise NotImplementedError(f"Implement fetch_fn to read {base_url} between {t1} and {t2}.")
 
     return fetch_fn
 

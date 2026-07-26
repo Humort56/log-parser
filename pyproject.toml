@@ -1,5 +1,6 @@
 [build-system]
-requires = ["setuptools>=64"]
+# >=77 for PEP 639 license expressions (license = "MIT" + license-files).
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,12 +8,23 @@ name = "log-parser"
 version = "0.1.0"
 description = "Local-first log parsing: Drain3 templates + SQLite occurrences"
 readme = "README.md"
-requires-python = ">=3.9"
-license = { text = "MIT" }
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Humort56" }]
 dependencies = ["drain3==0.9.11"]
 
+[project.urls]
+Homepage = "https://github.com/Humort56/log-parser"
+Repository = "https://github.com/Humort56/log-parser"
+
+[project.scripts]
+log-parser = "log_parser.__main__:main"
+
 [project.optional-dependencies]
-dev = ["pytest==9.1.1"]
+# Range rather than == so each interpreter in the CI matrix resolves what it
+# can; nothing here depends on a specific pytest version.
+dev = ["pytest>=8.4", "ruff>=0.14", "mypy>=1.14"]
 # The Streamlit UI (log_parser.ui) is optional: installing the library to use
 # LogParser in a pipeline must not drag in streamlit's transitive tree. Range
 # pins rather than == because these are consumed through stable public APIs,
@@ -23,3 +35,58 @@ ui = ["streamlit>=1.50,<2", "pandas>=2.0,<3"]
 # Listed explicitly so the test modules sitting beside the package at the repo
 # root are NOT swept into the installed distribution.
 packages = ["log_parser"]
+
+[tool.setuptools.package-data]
+# Without this marker the annotations throughout the package are invisible to a
+# consuming project's type checker (PEP 561).
+log_parser = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py310"
+# The prose-quality docstrings and SQL strings here sit naturally around 90
+# characters; ruff's default of 88 would force reflowing well-formed code.
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "UP",      # pyupgrade
+    "B",       # bugbear
+    "C4",      # comprehensions
+    "SIM",     # simplify
+    "BLE",     # blind except -- source carries deliberate `# noqa: BLE001`
+    "A",       # builtin shadowing
+    "RET",     # return
+    "PTH",     # prefer pathlib
+    "ARG",     # unused arguments
+    "TID",     # tidy imports
+    "RUF",
+]
+ignore = [
+    "SIM105",  # contextlib.suppress is not clearer than try/except here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# E501: long parametrize rows read better unwrapped than reflowed.
+# ARG005: `lambda t1, t2: [...]` stubs must match the FetchFn signature; the
+#         unused parameters are the point, not an oversight.
+"tests/*" = ["E501", "ARG005"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["log_parser"]
+strict = true
+warn_unreachable = true
+
+# drain3 and pandas ship no py.typed marker. Silenced per-module rather than
+# globally so a typo in one of our own module paths is still an error --
+# streamlit is deliberately absent here because it *is* typed.
+[[tool.mypy.overrides]]
+module = ["drain3.*", "pandas.*"]
+ignore_missing_imports = true

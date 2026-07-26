@@ -1,3 +1,0 @@
-# Runtime dependency. drain3 itself pins jsonpickle==1.5.1 and cachetools==4.2.1,
-# so those are resolved transitively rather than listed here.
-drain3==0.9.11

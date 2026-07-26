@@ -24,16 +24,21 @@ affects matching. SQLite remains the sole source of truth for occurrences.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
-from typing import Any, Callable, Dict, Iterable, List, Tuple
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
+from typing import Any
 
 from drain3 import TemplateMiner
 from drain3.file_persistence import FilePersistence
 from drain3.template_miner_config import TemplateMinerConfig
 
-Record = Dict[str, Any]
-Range = Tuple[int, int]
-FetchFn = Callable[[int, int], List[Record]]
+logger = logging.getLogger(__name__)
+
+Record = dict[str, Any]
+Range = tuple[int, int]
+FetchFn = Callable[[int, int], list[Record]]
 
 DEFAULT_MARGIN_SEC = 60
 
@@ -42,7 +47,8 @@ DEFAULT_MARGIN_SEC = 60
 # Coverage algebra. Ranges are inclusive integer seconds: [start, end].
 # --------------------------------------------------------------------------
 
-def merge_ranges(ranges: Iterable[Range]) -> List[Range]:
+
+def merge_ranges(ranges: Iterable[Range]) -> list[Range]:
     """Merge overlapping and *adjacent* inclusive ranges.
 
     Adjacency matters: on inclusive integer seconds (100, 140) and (141, 200)
@@ -62,12 +68,12 @@ def merge_ranges(ranges: Iterable[Range]) -> List[Range]:
     return [(start, end) for start, end in merged]
 
 
-def missing_ranges(t1: int, t2: int, covered: Iterable[Range]) -> List[Range]:
+def missing_ranges(t1: int, t2: int, covered: Iterable[Range]) -> list[Range]:
     """Sub-intervals of [t1, t2] not covered by ``covered``."""
     if t2 < t1:
         return []
 
-    gaps: List[Range] = []
+    gaps: list[Range] = []
     cursor = t1
     for start, end in merge_ranges(covered):
         if end < cursor:
@@ -89,6 +95,7 @@ def missing_ranges(t1: int, t2: int, covered: Iterable[Range]) -> List[Range]:
 # Model
 # --------------------------------------------------------------------------
 
+
 class TemplateModel:
     """Drain3 template tree with its own file persistence."""
 
@@ -104,7 +111,20 @@ class TemplateModel:
     def template_id(self, message: str) -> int:
         """Match or learn ``message``; return its cluster id."""
         # message arrives already separated from its timestamp -- feed it as-is.
-        return self._miner.add_log_message(message)["cluster_id"]
+        # drain3 is untyped, so the id comes back as Any; pin it to int here
+        # rather than letting that leak into every caller.
+        return int(self._miner.add_log_message(message)["cluster_id"])
+
+    def clusters(self) -> dict[int, tuple[str, int]]:
+        """``{cluster_id: (template_text, all_time_occurrences)}`` from the tree.
+
+        Exposed here so callers do not have to reach through ``_miner`` into
+        drain3's internals to render template text.
+        """
+        return {
+            cluster.cluster_id: (cluster.get_template(), cluster.size)
+            for cluster in self._miner.drain.clusters
+        }
 
     def save(self) -> None:
         """Flush the template tree so learning since the last snapshot survives."""
@@ -141,21 +161,54 @@ class SqliteStore:
     """SQLite occurrence store plus the record of which windows were fetched."""
 
     def __init__(self, db_path: str):
-        self._db = sqlite3.connect(db_path)
+        # timeout: the UI reads this store from a second connection while a
+        # query may be writing, so a busy database should wait rather than
+        # raise immediately.
+        self._db = sqlite3.connect(db_path, timeout=30.0)
+        # WAL lets that reader proceed concurrently with the writer instead of
+        # blocking. It is recorded in the file header and so persists across
+        # connections -- note it is unsuitable on network filesystems.
+        self._db.execute("PRAGMA journal_mode=WAL")
+        # NORMAL trades an fsync per commit for one at checkpoint; with WAL the
+        # worst case is losing the last transactions on power loss, not a
+        # corrupt database.
+        self._db.execute("PRAGMA synchronous=NORMAL")
         self._db.executescript(_SCHEMA)
         self._db.commit()
+        self._in_bulk = False
 
-    def add_event(self, template_id: int, ts: int, source_key: str, extra: dict) -> bool:
+    @contextmanager
+    def bulk(self) -> Iterator[None]:
+        """Group inserts into one transaction, committing once on exit.
+
+        ``add_event`` commits per row so a direct ``ingest`` is durable
+        immediately. That costs a commit per record when ingesting a whole
+        fetched window, which is what :meth:`LogParser.query` does -- so it
+        wraps its ingest loop in this instead.
+        """
+        self._in_bulk = True
+        try:
+            yield
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            raise
+        finally:
+            self._in_bulk = False
+
+    def add_event(self, template_id: int, ts: int, source_key: str, extra: dict[str, Any]) -> bool:
         """Insert one occurrence. Returns False when dedup rejected it."""
         cursor = self._db.execute(
-            "INSERT OR IGNORE INTO events(ts, template_id, source_key, extra) "
-            "VALUES(?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO events(ts, template_id, source_key, extra) VALUES(?, ?, ?, ?)",
             (ts, template_id, source_key, json.dumps(extra or {})),
         )
-        self._db.commit()
+        if not self._in_bulk:
+            self._db.commit()
+        # rowcount is set by the INSERT itself, so this stays correct inside a
+        # bulk block where the commit has not happened yet.
         return cursor.rowcount == 1
 
-    def read_events(self, t1: int, t2: int) -> List[Record]:
+    def read_events(self, t1: int, t2: int) -> list[Record]:
         rows = self._db.execute(
             "SELECT ts, template_id, source_key, extra FROM events "
             "WHERE ts BETWEEN ? AND ? ORDER BY ts, id",
@@ -172,9 +225,9 @@ class SqliteStore:
         ]
 
     def count_events(self) -> int:
-        return self._db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        return int(self._db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
 
-    def template_counts(self, t1: int, t2: int) -> List[Tuple[int, int]]:
+    def template_counts(self, t1: int, t2: int) -> list[tuple[int, int]]:
         """(template_id, occurrences) in [t1, t2], most frequent first.
 
         Aggregated in SQL rather than over read rows so the counts stay exact
@@ -190,12 +243,12 @@ class SqliteStore:
             ).fetchall()
         ]
 
-    def ts_bounds(self) -> Tuple[int, int] | None:
+    def ts_bounds(self) -> tuple[int, int] | None:
         """(min_ts, max_ts) across all events, or None when the store is empty."""
         low, high = self._db.execute("SELECT MIN(ts), MAX(ts) FROM events").fetchone()
         return None if low is None else (low, high)
 
-    def fetched_ranges(self) -> List[Range]:
+    def fetched_ranges(self) -> list[Range]:
         return [
             (start, end)
             for start, end in self._db.execute(
@@ -213,16 +266,23 @@ class SqliteStore:
     def covered(self, t1: int, t2: int) -> bool:
         return not missing_ranges(t1, t2, self.fetched_ranges())
 
-    def missing(self, t1: int, t2: int) -> List[Range]:
+    def missing(self, t1: int, t2: int) -> list[Range]:
         return missing_ranges(t1, t2, self.fetched_ranges())
 
     def close(self) -> None:
         self._db.close()
 
+    def __enter__(self) -> SqliteStore:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
 
 # --------------------------------------------------------------------------
 # Coordinator
 # --------------------------------------------------------------------------
+
 
 class LogParser:
     """Parses, stores and serves log records local-first.
@@ -254,16 +314,26 @@ class LogParser:
             record.get("extra") or {},
         )
 
-    def query(self, t1: int, t2: int) -> List[Record]:
+    def query(self, t1: int, t2: int) -> list[Record]:
         """Return records in [t1, t2], fetching only windows not already fetched."""
-        for gap_start, gap_end in self.store.missing(t1, t2):
+        gaps = self.store.missing(t1, t2)
+        logger.debug("query [%d, %d]: %d gap(s) to fetch", t1, t2, len(gaps))
+        for gap_start, gap_end in gaps:
             # Fetch wide: pad the gap so records near its edges are not missed.
             fetched = self._fetch_fn(
                 gap_start - self._margin_sec,
                 gap_end + self._margin_sec,
             )
-            for record in fetched or ():
-                self.ingest(record)
+            # One transaction for the whole gap rather than one commit per row.
+            with self.store.bulk():
+                stored = sum(self.ingest(record) for record in fetched or ())
+            logger.debug(
+                "gap [%d, %d]: fetched %d record(s), stored %d",
+                gap_start,
+                gap_end,
+                len(fetched or ()),
+                stored,
+            )
             # Record exact: only the un-padded gap is marked as fetched, so the
             # padding never inflates our claim about what we actually have.
             self.store.record_range(gap_start, gap_end)
@@ -273,3 +343,9 @@ class LogParser:
     def close(self) -> None:
         self.model.save()
         self.store.close()
+
+    def __enter__(self) -> LogParser:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()

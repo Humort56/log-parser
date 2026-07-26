@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -m ruff check . --output-format=concise)",
+      "Bash(awk '{print $1}')"
+    ]
+  }
+}

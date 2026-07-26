@@ -34,19 +34,28 @@ This module deliberately does not import streamlit: the UI reads
 
 from __future__ import annotations
 
+import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Any, Literal
 
 from log_parser.core import FetchFn, Record
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
+    "DEMO_FETCHER_NAME",
     "ConfigField",
     "Fetcher",
-    "validated",
+    "FieldKind",
     "demo_fetcher",
-    "DEMO_FETCHER_NAME",
+    "validated",
 ]
+
+#: Widget type for a ConfigField. A typo here used to fall through silently to
+#: the text widget; as a Literal it is a type error instead.
+FieldKind = Literal["text", "int", "float"]
 
 
 @dataclass(frozen=True)
@@ -56,7 +65,7 @@ class ConfigField:
     key: str
     label: str
     default: Any
-    kind: str = "text"  # "text" | "int" | "float"
+    kind: FieldKind = "text"
     help: str = ""
 
 
@@ -71,10 +80,10 @@ class Fetcher:
 
     name: str
     description: str
-    build: Callable[[Dict[str, Any]], FetchFn]
-    config_fields: List[ConfigField] = field(default_factory=list)
+    build: Callable[[dict[str, Any]], FetchFn]
+    config_fields: list[ConfigField] = field(default_factory=list)
 
-    def defaults(self) -> Dict[str, Any]:
+    def defaults(self) -> dict[str, Any]:
         return {f.key: f.default for f in self.config_fields}
 
 
@@ -82,7 +91,8 @@ class Fetcher:
 # Validation
 # --------------------------------------------------------------------------
 
-def validated(fetch_fn: FetchFn, skipped: List[Record]) -> FetchFn:
+
+def validated(fetch_fn: FetchFn, skipped: list[Record]) -> FetchFn:
     """Wrap ``fetch_fn`` so malformed records are dropped rather than ingested.
 
     ``LogParser.ingest`` indexes ``message``/``ts``/``source_key`` directly, so a
@@ -92,11 +102,14 @@ def validated(fetch_fn: FetchFn, skipped: List[Record]) -> FetchFn:
     ``skipped`` so the loss is visible rather than silent.
     """
 
-    def wrapped(t1: int, t2: int) -> List[Record]:
-        clean: List[Record] = []
+    def wrapped(t1: int, t2: int) -> list[Record]:
+        clean: list[Record] = []
         for record in fetch_fn(t1, t2) or ():
+            # FetchFn says this is always a dict, so mypy calls the branch
+            # unreachable -- but the whole point here is that the fetcher is
+            # third-party code that may not honour its annotation.
             if not isinstance(record, dict):
-                skipped.append(record)
+                skipped.append(record)  # type: ignore[unreachable]
                 continue
             message, ts, source_key = (
                 record.get("message"),
@@ -113,12 +126,21 @@ def validated(fetch_fn: FetchFn, skipped: List[Record]) -> FetchFn:
                 skipped.append(record)
                 continue
             extra = record.get("extra")
-            clean.append({
-                "message": message,
-                "ts": ts,
-                "source_key": source_key,
-                "extra": extra if isinstance(extra, dict) else {},
-            })
+            clean.append(
+                {
+                    "message": message,
+                    "ts": ts,
+                    "source_key": source_key,
+                    "extra": extra if isinstance(extra, dict) else {},
+                }
+            )
+        if skipped:
+            logger.warning(
+                "Dropped %d malformed record(s) from the fetch of [%d, %d]",
+                len(skipped),
+                t1,
+                t2,
+            )
         return clean
 
     return wrapped
@@ -130,7 +152,11 @@ def validated(fetch_fn: FetchFn, skipped: List[Record]) -> FetchFn:
 
 DEMO_FETCHER_NAME = "demo (synthetic)"
 
-_DEMO_MESSAGES: Tuple[Tuple[str, str], ...] = (
+#: Ceiling on records one demo fetch will build. A year-wide window at the
+#: densest setting would otherwise materialise ~31M dicts in memory.
+MAX_DEMO_RECORDS = 200_000
+
+_DEMO_MESSAGES: tuple[tuple[str, str], ...] = (
     ("User {n} logged in from 10.0.0.{octet}", "INFO"),
     ("Request {n} completed in {ms}ms", "INFO"),
     ("Disk sd{disk} full at {pct}%", "ERROR"),
@@ -139,11 +165,11 @@ _DEMO_MESSAGES: Tuple[Tuple[str, str], ...] = (
 )
 
 
-def _build_demo(config: Dict[str, Any]) -> FetchFn:
+def _build_demo(config: dict[str, Any]) -> FetchFn:
     per_minute = max(1, int(config.get("per_minute", 6)))
     sources = max(1, int(config.get("sources", 3)))
 
-    def fetch_fn(t1: int, t2: int) -> List[Record]:
+    def fetch_fn(t1: int, t2: int) -> list[Record]:
         # Events sit on a fixed absolute grid (multiples of `step` since the
         # epoch), never one relative to t1. Two overlapping fetches must agree
         # exactly on the events in the seconds they share, otherwise identity
@@ -151,8 +177,20 @@ def _build_demo(config: Dict[str, Any]) -> FetchFn:
         # them -- the padded refetch would silently double the rows.
         step = max(1, 60 // per_minute)
         first = t1 + (-t1 % step)
-        records: List[Record] = []
-        for ts in range(first, t2 + 1, step):
+        records: list[Record] = []
+        # Truncate from the end of the window rather than thinning the grid:
+        # the absolute positions of the records that *are* returned must not
+        # change, or dedup across overlapping fetches breaks.
+        last = min(t2, first + (MAX_DEMO_RECORDS - 1) * step)
+        if last < t2:
+            logger.warning(
+                "Demo window [%d, %d] capped at %d records; showing up to %d",
+                t1,
+                t2,
+                MAX_DEMO_RECORDS,
+                last,
+            )
+        for ts in range(first, last + 1, step):
             rng = random.Random(ts)
             # Index by grid position, not by ts: ts is always a multiple of
             # step, so `ts % len(...)` would collapse to one shape whenever
@@ -166,19 +204,21 @@ def _build_demo(config: Dict[str, Any]) -> FetchFn:
                 pct=rng.randint(80, 99),
             )
             host = f"server{ts % sources + 1}"
-            records.append({
-                "message": message,
-                "ts": ts,
-                "source_key": f"clientA|{host}",
-                "extra": {
-                    "level": level,
-                    "host": host,
-                    # A nested value on purpose: it exercises the JSON rendering
-                    # path in the UI's filters from the very first window.
-                    "trace": {"span": rng.randint(1000, 9999), "retries": ts % 3},
-                    "tags": ["demo", level.lower()],
-                },
-            })
+            records.append(
+                {
+                    "message": message,
+                    "ts": ts,
+                    "source_key": f"clientA|{host}",
+                    "extra": {
+                        "level": level,
+                        "host": host,
+                        # A nested value on purpose: it exercises the JSON rendering
+                        # path in the UI's filters from the very first window.
+                        "trace": {"span": rng.randint(1000, 9999), "retries": ts % 3},
+                        "tags": ["demo", level.lower()],
+                    },
+                }
+            )
         return records
 
     return fetch_fn
@@ -198,9 +238,19 @@ def demo_fetcher() -> Fetcher:
         ),
         build=_build_demo,
         config_fields=[
-            ConfigField("per_minute", "Events per minute", 6, "int",
-                        help="Higher values produce denser windows."),
-            ConfigField("sources", "Distinct source hosts", 3, "int",
-                        help="How many source_key values to spread events across."),
+            ConfigField(
+                "per_minute",
+                "Events per minute",
+                6,
+                "int",
+                help="Higher values produce denser windows.",
+            ),
+            ConfigField(
+                "sources",
+                "Distinct source hosts",
+                3,
+                "int",
+                help="How many source_key values to spread events across.",
+            ),
         ],
     )

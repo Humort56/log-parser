@@ -14,8 +14,15 @@ import sys
 import log_parser
 
 V1_NAMES = [
-    "DEFAULT_MARGIN_SEC", "FetchFn", "LogParser", "Range", "Record",
-    "SqliteStore", "TemplateModel", "merge_ranges", "missing_ranges",
+    "DEFAULT_MARGIN_SEC",
+    "FetchFn",
+    "LogParser",
+    "Range",
+    "Record",
+    "SqliteStore",
+    "TemplateModel",
+    "merge_ranges",
+    "missing_ranges",
 ]
 
 
@@ -42,7 +49,9 @@ def test_unknown_attribute_still_raises_attribute_error():
     import pytest
 
     with pytest.raises(AttributeError):
-        log_parser.definitely_not_a_real_name
+        # The bare access *is* the assertion: it must reach __getattr__ and
+        # raise rather than being swallowed into an import attempt.
+        log_parser.definitely_not_a_real_name  # noqa: B018
 
 
 def test_core_classes_are_usable_from_the_facade(tmp_path):
@@ -51,10 +60,17 @@ def test_core_classes_are_usable_from_the_facade(tmp_path):
         db_path=str(tmp_path / "events.db"),
         state_path=str(tmp_path / "drain3.bin"),
     )
-    assert parser.ingest({
-        "message": "User 1 logged in", "ts": 100,
-        "source_key": "s", "extra": {},
-    }) is True
+    assert (
+        parser.ingest(
+            {
+                "message": "User 1 logged in",
+                "ts": 100,
+                "source_key": "s",
+                "extra": {},
+            }
+        )
+        is True
+    )
     parser.close()
 
     assert log_parser.merge_ranges([(100, 140), (141, 200)]) == [(100, 200)]
@@ -96,7 +112,9 @@ def test_importing_the_parser_does_not_pull_in_streamlit():
         "print('clean')"
     )
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True,
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr
     assert "clean" in result.stdout

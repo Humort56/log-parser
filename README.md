@@ -10,19 +10,20 @@ fetched before.
 ## Install
 
 ```bash
-pip install git+https://github.com/<user>/<repo>.git
+pip install git+https://github.com/Humort56/log-parser.git
 ```
 
-Pin a tag or commit for reproducible installs:
+Pin a tag or commit for reproducible installs (no tags are published yet, so
+pin a commit until one is):
 
 ```bash
-pip install git+https://github.com/<user>/<repo>.git@v0.1.0
+pip install git+https://github.com/Humort56/log-parser.git@<commit-sha>
 ```
 
 The web UI is an optional extra, so installing the library alone stays light:
 
 ```bash
-pip install "log-parser[ui] @ git+https://github.com/<user>/<repo>.git"
+pip install "log-parser[ui] @ git+https://github.com/Humort56/log-parser.git"
 ```
 
 ## Usage
@@ -33,31 +34,37 @@ that touches the remote log source; it knows nothing about coverage, padding, or
 ```python
 from log_parser import LogParser
 
+
 def fetch_fn(t1, t2):
     # Return every record whose ts falls in [t1, t2].
     return [
-        {"message": "User 12 logged in from 10.0.0.1",
-         "ts": 1_700_000_000,
-         "source_key": "clientA|server1",
-         "extra": {"level": "INFO"}},
+        {
+            "message": "User 12 logged in from 10.0.0.1",
+            "ts": 1_700_000_000,
+            "source_key": "clientA|server1",
+            "extra": {"level": "INFO"},
+        },
     ]
 
-parser = LogParser(
+
+# Use it as a context manager: leaving the block flushes the Drain3 template
+# snapshot, even if the body raises. `parser.close()` does the same by hand.
+with LogParser(
     fetch_fn=fetch_fn,
     db_path="events.db",
     state_path="drain3.bin",
     margin_sec=60,
-)
+) as parser:
+    parser.ingest(
+        {
+            "message": "Disk sda full at 91%",
+            "ts": 1_700_000_120,
+            "source_key": "clientA|server2",
+            "extra": {"level": "ERROR"},
+        }
+    )
 
-parser.ingest({
-    "message": "Disk sda full at 91%",
-    "ts": 1_700_000_120,
-    "source_key": "clientA|server2",
-    "extra": {"level": "ERROR"},
-})
-
-rows = parser.query(1_700_000_000, 1_700_000_200)
-parser.close()   # flushes the Drain3 template snapshot
+    rows = parser.query(1_700_000_000, 1_700_000_200)
 ```
 
 ### The record
@@ -104,8 +111,8 @@ matches the mined template text.
 For a look around with synthetic data and no configuration:
 
 ```bash
-pip install "log-parser[ui] @ git+https://github.com/<user>/<repo>.git"
-python -m log_parser
+pip install "log-parser[ui] @ git+https://github.com/Humort56/log-parser.git"
+log-parser                 # or: python -m log_parser
 ```
 
 ### Pointing it at your logs
@@ -118,20 +125,24 @@ inside the package to edit:
 # app.py
 from log_parser import ConfigField, Fetcher, run_app
 
+
 def build_fetcher(config):
-    base_url = config["base_url"]          # from the sidebar widgets below
+    base_url = config["base_url"]  # from the sidebar widgets below
 
     def fetch_fn(t1, t2):
         # Return every record whose ts falls in [t1, t2] (inclusive, UTC epoch).
         return [
-            {"message": hit["msg"],
-             "ts": int(hit["timestamp"]),
-             "source_key": f'{hit["cluster"]}|{hit["host"]}',
-             "extra": {"level": hit["level"]}}
+            {
+                "message": hit["msg"],
+                "ts": int(hit["timestamp"]),
+                "source_key": f"{hit['cluster']}|{hit['host']}",
+                "extra": {"level": hit["level"]},
+            }
             for hit in my_client.search(base_url, t1, t2)
         ]
 
     return fetch_fn
+
 
 run_app(
     Fetcher(
@@ -148,9 +159,10 @@ run_app(
 streamlit run app.py
 ```
 
-There is a ready-to-edit copy in [app.py](app.py). Streamlit options work as
-usual (`streamlit run app.py --server.port 8600`); `python -m log_parser`
-forwards them too.
+There is a ready-to-edit copy in [examples/app.py](examples/app.py). Streamlit
+options work as usual (`streamlit run app.py --server.port 8600`); `log-parser`
+forwards anything it does not recognise, so `log-parser --server.port 8600`
+works too. `--help` and `--version` are handled by `log-parser` itself.
 
 `build(config)` is split from `fetch_fn` so an expensive client is constructed
 once per settings change rather than once per fetch. `config_fields` render as
@@ -176,18 +188,30 @@ importing it is what pulls Streamlit in, not importing the parser.
 
 ## Development
 
+Requires Python 3.10 or newer.
+
 ```bash
 python -m venv .venv
 .venv/Scripts/pip install -e ".[dev,ui]"    # Linux/macOS: .venv/bin/pip
-.venv/Scripts/python -m pytest -q
+.venv/Scripts/python -m pytest
 ```
 
 Omit `,ui` to work on the parser alone; the UI tests skip themselves when
 Streamlit is absent.
 
-Tests: two cover the module contract (ingestion, and that padding cannot
-duplicate); the rest cover the coverage algebra (`merge_ranges`,
-`missing_ranges`), the UI's pure helpers, and the package facade.
+The same three gates run in CI on every push and pull request, across Python
+3.10–3.13:
+
+```bash
+.venv/Scripts/python -m pytest
+.venv/Scripts/python -m ruff check . && .venv/Scripts/python -m ruff format --check .
+.venv/Scripts/python -m mypy
+```
+
+Tests live in [tests/](tests/): two cover the module contract (ingestion, and
+that padding cannot duplicate); the rest cover the coverage algebra
+(`merge_ranges`, `missing_ranges`), the UI's pure helpers, and the package
+facade.
 
 ## Notes
 
