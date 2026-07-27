@@ -6,6 +6,12 @@ Run it with::
 
 Everything specific to *your* logs lives here, in your own file. `log_parser`
 stays an ordinary dependency you can upgrade without losing this code.
+
+Before loading a window in the UI -- which writes to your real store -- try the
+fetcher on its own. `check()` parses into a temp directory and writes a report
+of the templates your config mined, leaving nothing else behind::
+
+    python -c "import app; from log_parser import check; print(check(app.SOURCE, last='10m'))"
 """
 
 from typing import Any
@@ -69,16 +75,20 @@ def render_levels(ctx: ViewContext) -> None:
     st.bar_chart(counts)
 
 
+# A module-level name so a test run can reach it without starting the UI:
+#     python -c "import app; from log_parser import check; print(check(app.SOURCE, last='10m'))"
+SOURCE = Fetcher(
+    name="my source",
+    description="Describe where these logs come from; shown in the sidebar.",
+    build=build_fetcher,
+    # Rendered as sidebar widgets automatically. kind is "text"/"int"/"float".
+    config_fields=[
+        ConfigField("base_url", "Base URL", default="https://logs.example.com"),
+    ],
+)
+
 run_app(
-    Fetcher(
-        name="my source",
-        description="Describe where these logs come from; shown in the sidebar.",
-        build=build_fetcher,
-        # Rendered as sidebar widgets automatically. kind is "text"/"int"/"float".
-        config_fields=[
-            ConfigField("base_url", "Base URL", default="https://logs.example.com"),
-        ],
-    ),
+    SOURCE,
     title="my logs",
     # One app reads one source into one store. For a second source, copy this
     # file and give it its own db_path so the coverage ranges stay separate.

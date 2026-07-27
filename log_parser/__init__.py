@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 # into a user's app.py -- `from log_parser import TemplateMinerConfig`.
 from drain3.template_miner_config import TemplateMinerConfig
 
+from log_parser.checks import CheckReport, CheckStep, check
 from log_parser.core import (
     DEFAULT_MARGIN_SEC,
     FetchFn,
@@ -60,6 +61,8 @@ logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
     "DEFAULT_MARGIN_SEC",
+    "CheckReport",
+    "CheckStep",
     "ConfigField",
     "FetchFn",
     "Fetcher",
@@ -74,6 +77,7 @@ __all__ = [
     "View",
     "ViewContext",
     "__version__",
+    "check",
     "config_fingerprint",
     "merge_ranges",
     "missing_ranges",

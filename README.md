@@ -172,6 +172,9 @@ The app is a plain frontend to `LogParser.query`: loading a window reads locally
 when it is already covered and fetches only the ranges that are missing. There
 is no separate "offline" mode, because `query` already makes that decision.
 
+Before pointing it at a real store, try the fetcher on its own — see
+[Test run](#test-run).
+
 ### Tuning how messages are mined
 
 Drain3's own settings — the similarity threshold, tree depth, masking rules —
@@ -181,7 +184,7 @@ are passed as a `TemplateMinerConfig`, re-exported so you need no second import:
 from log_parser import LogParser, TemplateMinerConfig
 
 config = TemplateMinerConfig()
-config.drain_sim_th = 0.6   # stricter: more templates, each narrower
+config.drain_sim_th = 0.6  # stricter: more templates, each narrower
 config.drain_depth = 5
 
 parser = LogParser(fetch_fn, db_path="events.db", state_path="drain3.bin", config=config)
@@ -205,6 +208,9 @@ disagrees logs a warning naming both digests. Nothing raises — you may have
 changed the config deliberately — but it will not pass unnoticed. Settings that
 do not affect mining (profiling, snapshot cadence) are excluded, so they never
 trigger it.
+
+To see which templates a config actually produces before committing to it, run
+it against a temporary store first — see [Test run](#test-run).
 
 ### Custom views and layout
 
@@ -279,6 +285,97 @@ log_parser` never does, so the parser keeps working wherever the `ui` extra is
 not installed. `run_app` is re-exported from `log_parser` but resolved lazily, so
 importing it is what pulls Streamlit in, not importing the parser.
 
+## Test run
+
+`check()` runs your fetcher over one window and mines the result with your
+config, then writes a Markdown report of the templates it derived and the events
+they produced. Loading a window in the UI is the only other way to exercise
+either one, and that writes to your real store — so without this, a mistyped
+`ts` or a threshold that collapses everything into one template is discovered
+only after the rows are committed under ids a re-query will not re-derive.
+
+```python
+from log_parser import check
+from myapp import FETCHER, CONFIG
+
+report = check(FETCHER, last="10m", config=CONFIG)
+print(report)  # short summary
+assert report.ok  # so it works inside your own pytest too
+```
+
+**A test run parses into a temp directory and leaves only the report.** No
+`events.db`, no `drain3.bin`, nothing appended to the store you already have —
+it is safe against a live deployment.
+
+Pick the window explicitly, either relative or fixed:
+
+```python
+check(FETCHER, last="2h")  # ending now
+check(FETCHER, window=(1769504400, 1769505000))  # fixed UTC epoch seconds
+```
+
+`last=` takes `s`/`m`/`h`/`d` (`"30s"`, `"10m"`, `"2h"`, `"7d"`) or a plain
+number of seconds. One of the two is required and there is no default: an
+implicit "last ten minutes" against a source whose data is older returns
+nothing, and an empty report reads exactly like a broken fetcher.
+
+| step | what it proves |
+| --- | --- |
+| `build` | `build(config)` runs, using `Fetcher.defaults()` unless `fetcher_config=` overrides them |
+| `fetch` | `fetch_fn(t1, t2)` returns without raising, and how long it took |
+| `records` | records carry a string `message`, an int `ts`, a string `source_key` — the same check that runs at ingest |
+| `mining` | messages collapse into templates under your config, and how many were deduped |
+| `snapshot` | your config still matches the one an existing snapshot was built with (only with `state_path=`) |
+
+`snapshot` is the one that catches a config change against an existing store.
+Today that mismatch is only ever logged, so in the UI you see it only if you
+happen to be watching the terminal:
+
+```python
+check(FETCHER, last="10m", config=CONFIG, state_path="drain3.bin")
+```
+
+The snapshot is read, never written. A failing `snapshot` step means the
+template ids already in your database were mined under different settings.
+
+The report itself is the deliverable — a pass/fail line cannot tell you whether
+`drain_sim_th` merged two things you needed kept apart, but the template table
+can, and two reports diff cleanly against each other:
+
+```markdown
+# check report — "demo (synthetic)"
+
+- window: `2026-01-27T09:00:00Z` → `2026-01-27T09:10:00Z` (600s, fixed window)
+- result: **PASSED**
+- drain3 fingerprint: `d5ffe80ef864bb4c`
+
+| step | ok | detail |
+| --- | --- | --- |
+| build | ✅ | built with {'per_minute': 6, 'sources': 3} |
+| fetch | ✅ | 61 record(s) in 0.00s |
+| records | ✅ | 61 valid, 0 skipped |
+| mining | ✅ | 5 template(s) from 61 message(s), 0 deduped |
+
+## Templates (5)
+
+| id | count | template |
+| --- | --- | --- |
+| 1 | 13 | `User <*> logged in from <*>` |
+| 2 | 12 | `Request <*> completed in <*>` |
+...
+```
+
+Every event is listed under `## Events`, not a sample, with the `template_id` it
+was stored under and its `extra` as JSON — those rows come back out of SQLite
+rather than from the fetch, so what you read is what would have been stored.
+Malformed records appear under `## Skipped records` exactly as the fetcher
+returned them.
+
+It lands in `./check-report.md`; pass `out="elsewhere.md"` to move it or
+`out=None` to skip the file and use the returned `CheckReport` directly. A
+failing step is reported rather than raised, so a broken fetcher still produces
+a report naming what broke.
+
 ## Development
 
 Requires Python 3.10 or newer.
@@ -303,8 +400,9 @@ The same three gates run in CI on every push and pull request, across Python
 
 Tests live in [tests/](tests/): two cover the module contract (ingestion, and
 that padding cannot duplicate); the rest cover the coverage algebra
-(`merge_ranges`, `missing_ranges`), the UI's pure helpers, and the package
-facade.
+(`merge_ranges`, `missing_ranges`), the UI's pure helpers, the package facade,
+the drain3 config fingerprint, and `check()` — including that it leaves nothing
+behind but its report.
 
 ## Notes
 

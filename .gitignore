@@ -39,6 +39,10 @@ drain3.bin
 # explicit config so it is ignored, but keep stray local copies out of the repo.
 drain3.ini
 
+# Written by check() into the working directory. A record of one local test run
+# against one window, not source.
+check-report.md
+
 # Streamlit writes local config/credentials here
 .streamlit/
 
